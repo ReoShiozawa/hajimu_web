@@ -1,7 +1,7 @@
 # .gitignore — hajimu_web
 
-# ビルド成果物
-*.hjp
+# ビルド成果物（.hjp はプリビルド配布のため含める）
+# *.hjp
 *.so
 *.dylib
 *.dll
