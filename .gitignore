@@ -1,0 +1,23 @@
+# .gitignore — hajimu_web
+
+# ビルド成果物
+*.hjp
+*.so
+*.dylib
+*.dll
+*.o
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# エディタ
+.vscode/
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+*.xcodeproj/
+*.xcworkspace/

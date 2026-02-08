@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>hajimu_web デモ</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif; background: #0d1117; color: #c9d1d9; }
+        header { background: #161b22; padding: 2rem; text-align: center; border-bottom: 1px solid #30363d; }
+        header h1 { font-size: 2rem; color: #58a6ff; }
+        header p { margin-top: 0.5rem; color: #8b949e; }
+        main { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; }
+        .card h2 { color: #58a6ff; margin-bottom: 0.5rem; }
+        .card p { color: #8b949e; line-height: 1.6; }
+        footer { text-align: center; padding: 2rem; color: #8b949e; font-size: 0.9rem; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🌐 hajimu_web</h1>
+        <p>はじむ言語の HTTP ウェブサーバープラグイン</p>
+    </header>
+    <main>
+        <div class="card">
+            <h2>✨ 特徴</h2>
+            <p>はじむ言語から HTTP サーバーを起動できる外部パッケージです。<br>
+               Flask や Express のようなシンプルな API でウェブアプリを開発できます。</p>
+        </div>
+        <div class="card">
+            <h2>📦 機能</h2>
+            <p>・HTTP/1.1 サーバー (GET / POST / PUT / DELETE)<br>
+               ・パスルーティング + パスパラメータ<br>
+               ・静的ファイル配信<br>
+               ・JSON レスポンスヘルパー<br>
+               ・CORS 対応</p>
+        </div>
+        <div class="card">
+            <h2>🚀 使い方</h2>
+            <p>このページは hajimu_web の静的ファイル配信機能で表示されています。</p>
+        </div>
+    </main>
+    <footer>
+        <p>hajimu_web v1.0.0 — はじむ言語プロジェクト</p>
+    </footer>
+</body>
+</html>
