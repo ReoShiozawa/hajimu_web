@@ -1,0 +1,64 @@
+// =============================================================================
+// rest_api_server.jp — hajimu_web v2.0 REST API デモ
+//
+// PUT/DELETE/PATCH メソッド、ルートグループ、
+// カスタムエラーページを使った本格的な REST API サーバー。
+//
+// 実行方法:
+//   nihongo rest_api_server.jp
+//
+// テスト:
+//   curl http://localhost:5000/api/v1/items
+//   curl -X POST http://localhost:5000/api/v1/items
+//   curl -X PUT http://localhost:5000/api/v1/items/1
+//   curl -X DELETE http://localhost:5000/api/v1/items/1
+//   curl -X PATCH http://localhost:5000/api/v1/items/1
+//   curl http://localhost:5000/health
+//   curl http://localhost:5000/nonexistent
+// =============================================================================
+
+取り込む "hajimu_web" として ウェブ
+
+// --- サーバー作成 ---
+ウェブ.サーバー作成(5000)
+
+// --- ミドルウェア ---
+ウェブ.ミドルウェア("logger")
+ウェブ.ミドルウェア("json")
+ウェブ.CORS設定("*", "GET,POST,PUT,DELETE,PATCH", "Content-Type,Authorization")
+
+// --- エラーページ（JSON形式） ---
+ウェブ.JSONエラーページ(404, "リソースが見つかりません")
+ウェブ.JSONエラーページ(405, "許可されていないメソッドです")
+ウェブ.JSONエラーページ(500, "サーバー内部エラー")
+
+// --- ヘルスチェック ---
+ウェブ.JSON応答("GET", "/health", "{\"状態\":\"正常\",\"バージョン\":\"2.0.0\"}")
+
+// --- API v1 グループ ---
+ウェブ.グループ("/api/v1")
+
+// アイテム CRUD
+ウェブ.JSON応答("GET", "/items", "[{\"id\":1,\"名前\":\"りんご\",\"価格\":150},{\"id\":2,\"名前\":\"みかん\",\"価格\":100}]")
+ウェブ.JSON応答("POST", "/items", "{\"結果\":\"アイテムを作成しました\",\"id\":3}")
+
+// PUT /api/v1/items/1 — 更新
+ウェブ.PUT("/items/1", "{\"結果\":\"アイテム1を更新しました\"}")
+
+// DELETE /api/v1/items/1 — 削除
+ウェブ.DELETE("/items/1", "{\"結果\":\"アイテム1を削除しました\"}")
+
+// PATCH /api/v1/items/1 — 部分更新
+ウェブ.PATCH("/items/1", "{\"結果\":\"アイテム1を部分更新しました\"}")
+
+// カテゴリ
+ウェブ.JSON応答("GET", "/categories", "[{\"id\":1,\"名前\":\"果物\"},{\"id\":2,\"名前\":\"野菜\"}]")
+
+ウェブ.グループ終了()
+
+// --- サーバー情報表示 ---
+ウェブ.ルート一覧()
+
+// --- 起動 ---
+表示("REST API デモサーバーをポート 5000 で起動します...")
+ウェブ.起動()
