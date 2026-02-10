@@ -1,10 +1,17 @@
 /**
- * hajimu_web — はじむ用 HTTP ウェブサーバープラグイン v2.0
+ * hajimu_web — はじむ用 HTTP ウェブサーバープラグイン v3.0
  *
  * Python の Flask / Node.js の Express に相当する本格的な HTTP サーバー。
  * 統一拡張子 .hjp（Hajimu Plugin）でクロスプラットフォーム対応。
  *
- * === v2.0 新機能 ===
+ * === v3.0 新機能 ===
+ *   - コールバック関数ハンドラ（はじむ関数をルートハンドラとして使用可能）
+ *   - Cookie 設定 / 削除（Set-Cookie ヘッダー）
+ *   - レスポンスヘッダー / ステータスコード / Content-Type 動的設定
+ *   - JSON パーサー / ジェネレーター（解析・生成ユーティリティ）
+ *   - レートリミッタミドルウェア（IP単位のレート制限）
+ *
+ * === v2.0 機能 ===
  *   - ミドルウェア / フィルタ機能（前後フック、チェーン実行、ロガー内蔵）
  *   - リクエストボディ自動解析（JSON / フォーム / テキスト自動判定）
  *   - 高度なルーティング（ワイルドカード, ルートグループ, 全メソッド対応）
@@ -20,6 +27,11 @@
  */
 
 #include "hajimu_plugin.h"
+
+/* hajimu_plugin_set_runtime デフォルト実装 */
+HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
+    __hajimu_runtime = rt;
+}
 
 #include <errno.h>
 #include <signal.h>
@@ -145,6 +157,7 @@ typedef enum {
     MW_JSON_PARSE,
     MW_FORM_PARSE,
     MW_STATIC_CACHE,
+    MW_RATE_LIMIT,
     MW_CUSTOM,
 } MiddlewareType;
 
@@ -166,6 +179,8 @@ typedef struct {
     int        static_body_len;
     Value    (*c_handler)(const HttpRequest *req);
     int        is_wildcard;
+    int        has_callback;       /* はじむ関数コールバック */
+    Value      callback_func;      /* VALUE_FUNCTION */
 } Route;
 
 typedef struct {
@@ -210,6 +225,18 @@ typedef struct {
     char          cors_headers[256];
     long long     total_requests;
     long long     error_count;
+    /* リクエスト処理中のレスポンスコンテキスト */
+    HttpResponse *current_resp;
+    socket_t      current_fd;
+    /* レートリミッタ設定 */
+    int           rate_limit_max;     /* ウィンドウあたり最大リクエスト数 */
+    int           rate_limit_window;  /* 秒 */
+    struct {
+        char ip[64];
+        int  count;
+        time_t window_start;
+    } rate_table[256];
+    int           rate_table_count;
 } WebServer;
 
 static WebServer g_server = {0};
@@ -687,7 +714,7 @@ static void send_response_obj(socket_t fd, HttpResponse *resp) {
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Date: %s\r\n"
-        "Server: hajimu_web/2.0.0\r\n"
+        "Server: hajimu_web/3.0.0\r\n"
         "Connection: close\r\n",
         resp->status_code, status_text(resp->status_code),
         resp->content_type, resp->body_length, date);
@@ -1115,7 +1142,7 @@ static int serve_static_file(socket_t fd, const HttpRequest *req) {
         "Content-Type: %s\r\n"
         "Content-Length: %ld\r\n"
         "Date: %s\r\n"
-        "Server: hajimu_web/2.0.0\r\n"
+        "Server: hajimu_web/3.0.0\r\n"
         "Connection: close\r\n",
         mime, file_size, date);
 
@@ -1196,16 +1223,71 @@ static int middleware_security_before(HttpRequest *req, HttpResponse *resp) {
     return 0;
 }
 
+static int middleware_rate_limit_before(HttpRequest *req, HttpResponse *resp) {
+    if (g_server.rate_limit_max <= 0) return 0;
+    time_t now = time(NULL);
+    int found = -1;
+    for (int i = 0; i < g_server.rate_table_count; i++) {
+        if (strcmp(g_server.rate_table[i].ip, req->client_ip) == 0) {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0) {
+        if (g_server.rate_table_count < 256) {
+            found = g_server.rate_table_count++;
+            snprintf(g_server.rate_table[found].ip,
+                     sizeof(g_server.rate_table[found].ip),
+                     "%s", req->client_ip);
+            g_server.rate_table[found].count = 0;
+            g_server.rate_table[found].window_start = now;
+        } else {
+            return 0; /* テーブル満杯 */
+        }
+    }
+    /* ウィンドウリセット */
+    int window = g_server.rate_limit_window > 0
+                 ? g_server.rate_limit_window : 60;
+    if (now - g_server.rate_table[found].window_start >= window) {
+        g_server.rate_table[found].count = 0;
+        g_server.rate_table[found].window_start = now;
+    }
+    g_server.rate_table[found].count++;
+    if (g_server.rate_table[found].count > g_server.rate_limit_max) {
+        resp->status_code = 429;
+        snprintf(resp->content_type, sizeof(resp->content_type),
+                 "application/json; charset=utf-8");
+        char body[256];
+        int blen = snprintf(body, sizeof(body),
+            "{\"error\":{\"code\":429,\"message\":\"リクエスト数が制限を超えました\"}}");
+        response_set_body(resp, body, blen);
+        char retry[32];
+        snprintf(retry, sizeof(retry), "%d",
+                 (int)(window - (now - g_server.rate_table[found].window_start)));
+        response_set_header(resp, "Retry-After", retry);
+        return 1; /* 中断 → レスポンス送信 */
+    }
+    /* X-RateLimit ヘッダー */
+    char rl_buf[32];
+    snprintf(rl_buf, sizeof(rl_buf), "%d", g_server.rate_limit_max);
+    response_set_header(resp, "X-RateLimit-Limit", rl_buf);
+    snprintf(rl_buf, sizeof(rl_buf), "%d",
+             g_server.rate_limit_max - g_server.rate_table[found].count);
+    response_set_header(resp, "X-RateLimit-Remaining", rl_buf);
+    return 0;
+}
+
 static int run_middlewares_before(HttpRequest *req, HttpResponse *resp) {
     for (int i = 0; i < g_server.middleware_count; i++) {
         Middleware *mw = &g_server.middlewares[i];
         if (!mw->enabled) continue;
         int result = 0;
         switch (mw->type) {
-            case MW_LOGGER:   result = middleware_logger_before(req, resp); break;
-            case MW_CORS:     result = middleware_cors_before(req, resp); break;
-            case MW_SECURITY: result = middleware_security_before(req, resp); break;
-            case MW_CUSTOM:   if (mw->before) result = mw->before(req, resp); break;
+            case MW_LOGGER:     result = middleware_logger_before(req, resp); break;
+            case MW_CORS:       result = middleware_cors_before(req, resp); break;
+            case MW_SECURITY:   result = middleware_security_before(req, resp); break;
+            case MW_RATE_LIMIT: result = middleware_rate_limit_before(req, resp); break;
+            case MW_CUSTOM:     if (mw->before) result = mw->before(req, resp); break;
             default: break;
         }
         if (result != 0) return 1; /* 中断 */
@@ -1412,8 +1494,60 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
     /* ルート検索 */
     Route *route = find_route(req.method, req.path, &req);
 
+    /* レスポンスコンテキストをグローバルに設定 */
+    g_server.current_resp = &resp;
+    g_server.current_fd   = client_fd;
+
     if (route) {
-        if (route->has_static_response) {
+        if (route->has_callback && hajimu_runtime_available()) {
+            /* === コールバック関数ハンドラ === */
+            Value req_val = request_to_value(&req);
+            Value result  = hajimu_call(&route->callback_func, 1, &req_val);
+
+            /* レスポンスがまだ送信されていない場合 */
+            if (!resp.sent) {
+                if (result.type == VALUE_STRING) {
+                    /* 文字列を返した場合: Content-Type 未設定なら自動判定 */
+                    if (resp.status_code == 200 && resp.body == NULL) {
+                        const char *s = result.string.data;
+                        if (s[0] == '{' || s[0] == '[') {
+                            snprintf(resp.content_type, sizeof(resp.content_type),
+                                     "application/json; charset=utf-8");
+                        }
+                    }
+                    if (resp.body == NULL) {
+                        response_set_body(&resp, result.string.data,
+                                          result.string.length);
+                    }
+                } else if (result.type == VALUE_NUMBER) {
+                    /* 数値を返した場合: ステータスコードとして使用 */
+                    resp.status_code = (int)result.number;
+                    if (resp.body == NULL) {
+                        const char *st = status_text(resp.status_code);
+                        response_set_body(&resp, st, (int)strlen(st));
+                    }
+                } else if (result.type == VALUE_ARRAY) {
+                    /* 配列を返した場合: [ステータス, Content-Type, ボディ] */
+                    if (result.array.length >= 1 &&
+                        result.array.elements[0].type == VALUE_NUMBER)
+                        resp.status_code = (int)result.array.elements[0].number;
+                    if (result.array.length >= 2 &&
+                        result.array.elements[1].type == VALUE_STRING)
+                        snprintf(resp.content_type, sizeof(resp.content_type),
+                                 "%s", result.array.elements[1].string.data);
+                    if (result.array.length >= 3 &&
+                        result.array.elements[2].type == VALUE_STRING)
+                        response_set_body(&resp,
+                            result.array.elements[2].string.data,
+                            result.array.elements[2].string.length);
+                }
+                if (resp.body == NULL) {
+                    response_set_body(&resp, "OK", 2);
+                }
+                run_middlewares_after(&req, &resp);
+                send_response_obj(client_fd, &resp);
+            }
+        } else if (route->has_static_response) {
             resp.status_code = route->static_status;
             snprintf(resp.content_type, sizeof(resp.content_type),
                      "%s", route->static_content_type);
@@ -1544,6 +1678,14 @@ static Value fn_middleware(int argc, Value *argv) {
         if (g_server.static_cache_seconds == 0)
             g_server.static_cache_seconds = 3600;
         g_server.static_etag = 1;
+    } else if (strcmp(name, "rate_limit") == 0 ||
+               strcmp(name, "rate-limit") == 0 ||
+               strcmp(name, "ratelimit") == 0) {
+        mw->type = MW_RATE_LIMIT;
+        if (g_server.rate_limit_max == 0) {
+            g_server.rate_limit_max = 100;   /* デフォルト: 100リクエスト/分 */
+            g_server.rate_limit_window = 60;
+        }
     } else {
         fprintf(stderr,
             "[hajimu_web] warning: unknown middleware '%s'\n", name);
@@ -1601,6 +1743,35 @@ static Value add_route(HttpMethod method, const char *raw_pattern,
     return hajimu_bool(true);
 }
 
+/* コールバック付きルートを追加 */
+static Value add_callback_route(HttpMethod method, const char *raw_pattern,
+                                Value *callback) {
+    if (g_server.route_count >= HW_MAX_ROUTES)
+        return hajimu_bool(false);
+
+    Route *r = &g_server.routes[g_server.route_count++];
+    memset(r, 0, sizeof(*r));
+    r->method = method;
+
+    if (g_server.active_group >= 0) {
+        snprintf(r->pattern, sizeof(r->pattern), "%s%s",
+                 g_server.groups[g_server.active_group].prefix,
+                 raw_pattern);
+    } else {
+        snprintf(r->pattern, sizeof(r->pattern), "%s", raw_pattern);
+    }
+
+    int plen = (int)strlen(r->pattern);
+    if (plen >= 2 && r->pattern[plen-1] == '*' && r->pattern[plen-2] == '/')
+        r->is_wildcard = 1;
+
+    r->has_static_response = 0;
+    r->has_callback = 1;
+    r->callback_func = *callback;
+    r->c_handler = NULL;
+    return hajimu_bool(true);
+}
+
 static Value fn_route_add(int argc, Value *argv) {
     if (argc < 5) return hajimu_bool(false);
     if (argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
@@ -1613,15 +1784,19 @@ static Value fn_route_add(int argc, Value *argv) {
 }
 
 static Value fn_get(int argc, Value *argv) {
-    if (argc < 2 || argv[0].type != VALUE_STRING ||
-        argv[1].type != VALUE_STRING)
+    if (argc < 2 || argv[0].type != VALUE_STRING)
         return hajimu_bool(false);
+    if (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)
+        return add_callback_route(METHOD_GET, argv[0].string.data, &argv[1]);
+    if (argv[1].type != VALUE_STRING) return hajimu_bool(false);
     return add_route(METHOD_GET, argv[0].string.data, 200,
                      "text/html; charset=utf-8", argv[1].string.data);
 }
 
 static Value fn_post(int argc, Value *argv) {
     if (argc < 2 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    if (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)
+        return add_callback_route(METHOD_POST, argv[0].string.data, &argv[1]);
     if (argc >= 4 && argv[1].type == VALUE_NUMBER)
         return add_route(METHOD_POST, argv[0].string.data,
                          (int)argv[1].number, argv[2].string.data,
@@ -1632,32 +1807,41 @@ static Value fn_post(int argc, Value *argv) {
 }
 
 static Value fn_put(int argc, Value *argv) {
-    if (argc < 2 || argv[0].type != VALUE_STRING ||
-        argv[1].type != VALUE_STRING)
+    if (argc < 2 || argv[0].type != VALUE_STRING)
         return hajimu_bool(false);
+    if (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)
+        return add_callback_route(METHOD_PUT, argv[0].string.data, &argv[1]);
+    if (argv[1].type != VALUE_STRING) return hajimu_bool(false);
     return add_route(METHOD_PUT, argv[0].string.data, 200,
                      "text/html; charset=utf-8", argv[1].string.data);
 }
 
 static Value fn_delete(int argc, Value *argv) {
-    if (argc < 2 || argv[0].type != VALUE_STRING ||
-        argv[1].type != VALUE_STRING)
+    if (argc < 2 || argv[0].type != VALUE_STRING)
         return hajimu_bool(false);
+    if (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)
+        return add_callback_route(METHOD_DELETE, argv[0].string.data, &argv[1]);
+    if (argv[1].type != VALUE_STRING) return hajimu_bool(false);
     return add_route(METHOD_DELETE, argv[0].string.data, 200,
                      "text/html; charset=utf-8", argv[1].string.data);
 }
 
 static Value fn_patch(int argc, Value *argv) {
-    if (argc < 2 || argv[0].type != VALUE_STRING ||
-        argv[1].type != VALUE_STRING)
+    if (argc < 2 || argv[0].type != VALUE_STRING)
         return hajimu_bool(false);
+    if (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)
+        return add_callback_route(METHOD_PATCH, argv[0].string.data, &argv[1]);
+    if (argv[1].type != VALUE_STRING) return hajimu_bool(false);
     return add_route(METHOD_PATCH, argv[0].string.data, 200,
                      "text/html; charset=utf-8", argv[1].string.data);
 }
 
 static Value fn_all_methods(int argc, Value *argv) {
-    if (argc < 2 || argv[0].type != VALUE_STRING ||
-        argv[1].type != VALUE_STRING)
+    if (argc < 2 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    if (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)
+        return add_callback_route(METHOD_ALL, argv[0].string.data, &argv[1]);
+    if (argv[1].type != VALUE_STRING)
         return hajimu_bool(false);
     return add_route(METHOD_ALL, argv[0].string.data, 200,
                      "text/html; charset=utf-8", argv[1].string.data);
@@ -1902,6 +2086,18 @@ static Value fn_cors_config(int argc, Value *argv) {
     return hajimu_bool(true);
 }
 
+/* レートリミッタ設定(最大リクエスト数, ウィンドウ秒) */
+static Value fn_rate_limit_config(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_NUMBER)
+        return hajimu_bool(false);
+    g_server.rate_limit_max = (int)argv[0].number;
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER)
+        g_server.rate_limit_window = (int)argv[1].number;
+    else
+        g_server.rate_limit_window = 60;
+    return hajimu_bool(true);
+}
+
 /* --- レスポンスヘルパー --- */
 
 static Value fn_redirect(int argc, Value *argv) {
@@ -1937,6 +2133,289 @@ static Value fn_redirect(int argc, Value *argv) {
         r->static_body_len = body_len;
     }
     return hajimu_bool(true);
+}
+
+/* --- #2 Cookie 設定 --- */
+
+/* Cookie設定(名前, 値)  または  Cookie設定(名前, 値, オプション文字列) */
+static Value fn_set_cookie(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+
+    char cookie[HW_MAX_HEADER_VALUE];
+    if (argc >= 3 && argv[2].type == VALUE_STRING) {
+        /* オプション付き: Cookie設定("token", "abc123", "Path=/; HttpOnly; Secure; Max-Age=3600") */
+        snprintf(cookie, sizeof(cookie), "%s=%s; %s",
+                 argv[0].string.data, argv[1].string.data,
+                 argv[2].string.data);
+    } else {
+        snprintf(cookie, sizeof(cookie), "%s=%s; Path=/; HttpOnly",
+                 argv[0].string.data, argv[1].string.data);
+    }
+    response_set_header(resp, "Set-Cookie", cookie);
+    return hajimu_bool(true);
+}
+
+/* Cookie削除(名前) */
+static Value fn_delete_cookie(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+
+    char cookie[HW_MAX_HEADER_VALUE];
+    snprintf(cookie, sizeof(cookie),
+             "%s=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0",
+             argv[0].string.data);
+    response_set_header(resp, "Set-Cookie", cookie);
+    return hajimu_bool(true);
+}
+
+/* --- #3 レスポンスヘッダー設定 --- */
+
+/* ヘッダー設定(キー, 値) */
+static Value fn_set_header(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+
+    response_set_header(resp, argv[0].string.data, argv[1].string.data);
+    return hajimu_bool(true);
+}
+
+/* --- #4 ステータスコード動的設定 --- */
+
+/* ステータス設定(コード) */
+static Value fn_set_status(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_NUMBER)
+        return hajimu_bool(false);
+
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+
+    resp->status_code = (int)argv[0].number;
+    return hajimu_bool(true);
+}
+
+/* --- #5 Content-Type 動的設定 --- */
+
+/* コンテンツタイプ設定(タイプ) */
+static Value fn_set_content_type(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+
+    snprintf(resp->content_type, sizeof(resp->content_type),
+             "%s", argv[0].string.data);
+    return hajimu_bool(true);
+}
+
+/* --- #6 JSON ユーティリティ --- */
+
+/* JSON解析 — 簡易 JSON パーサー（文字列 → はじむ配列/文字列） */
+static Value parse_json_value(const char **p);
+
+static void skip_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
+}
+
+static Value parse_json_string(const char **p) {
+    if (**p != '"') return hajimu_string("");
+    (*p)++; /* skip " */
+    char buf[HW_MAX_HEADER_VALUE];
+    int bi = 0;
+    while (**p && **p != '"' && bi < HW_MAX_HEADER_VALUE - 2) {
+        if (**p == '\\') {
+            (*p)++;
+            switch (**p) {
+                case '"':  buf[bi++] = '"'; break;
+                case '\\': buf[bi++] = '\\'; break;
+                case '/':  buf[bi++] = '/'; break;
+                case 'n':  buf[bi++] = '\n'; break;
+                case 't':  buf[bi++] = '\t'; break;
+                case 'r':  buf[bi++] = '\r'; break;
+                default:   buf[bi++] = **p; break;
+            }
+        } else {
+            buf[bi++] = **p;
+        }
+        (*p)++;
+    }
+    if (**p == '"') (*p)++; /* skip closing " */
+    buf[bi] = '\0';
+    return hajimu_string(buf);
+}
+
+static Value parse_json_value(const char **p) {
+    skip_ws(p);
+    if (**p == '"') {
+        return parse_json_string(p);
+    } else if (**p == '{') {
+        /* オブジェクト → 配列の配列 [[key, value], ...] */
+        (*p)++;
+        Value arr = hajimu_array();
+        skip_ws(p);
+        if (**p == '}') { (*p)++; return arr; }
+        while (**p) {
+            skip_ws(p);
+            Value key = parse_json_string(p);
+            skip_ws(p);
+            if (**p == ':') (*p)++;
+            Value val = parse_json_value(p);
+            Value pair = hajimu_array();
+            hajimu_array_push(&pair, key);
+            hajimu_array_push(&pair, val);
+            hajimu_array_push(&arr, pair);
+            skip_ws(p);
+            if (**p == ',') (*p)++;
+            else break;
+        }
+        skip_ws(p);
+        if (**p == '}') (*p)++;
+        return arr;
+    } else if (**p == '[') {
+        (*p)++;
+        Value arr = hajimu_array();
+        skip_ws(p);
+        if (**p == ']') { (*p)++; return arr; }
+        while (**p) {
+            Value val = parse_json_value(p);
+            hajimu_array_push(&arr, val);
+            skip_ws(p);
+            if (**p == ',') (*p)++;
+            else break;
+        }
+        skip_ws(p);
+        if (**p == ']') (*p)++;
+        return arr;
+    } else if (**p == 't') {
+        if (strncmp(*p, "true", 4) == 0) { *p += 4; return hajimu_bool(true); }
+        return hajimu_null();
+    } else if (**p == 'f') {
+        if (strncmp(*p, "false", 5) == 0) { *p += 5; return hajimu_bool(false); }
+        return hajimu_null();
+    } else if (**p == 'n') {
+        if (strncmp(*p, "null", 4) == 0) { *p += 4; return hajimu_null(); }
+        return hajimu_null();
+    } else if (**p == '-' || (**p >= '0' && **p <= '9')) {
+        char *end = NULL;
+        double num = strtod(*p, &end);
+        if (end != *p) { *p = end; return hajimu_number(num); }
+        return hajimu_null();
+    }
+    return hajimu_null();
+}
+
+/* JSON解析(文字列) → はじむ値 */
+static Value fn_json_parse(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_null();
+    const char *p = argv[0].string.data;
+    return parse_json_value(&p);
+}
+
+/* JSON生成 — はじむ値 → JSON 文字列 */
+static int value_to_json(Value *val, char *buf, int buf_size);
+
+static int value_to_json(Value *val, char *buf, int buf_size) {
+    int written = 0;
+    if (!val || buf_size <= 0) return 0;
+
+    switch (val->type) {
+        case VALUE_NULL:
+            written = snprintf(buf, buf_size, "null");
+            break;
+        case VALUE_BOOL:
+            written = snprintf(buf, buf_size, "%s",
+                               val->boolean ? "true" : "false");
+            break;
+        case VALUE_NUMBER: {
+            double n = val->number;
+            if (n == (int)n)
+                written = snprintf(buf, buf_size, "%d", (int)n);
+            else
+                written = snprintf(buf, buf_size, "%g", n);
+            break;
+        }
+        case VALUE_STRING: {
+            written = snprintf(buf, buf_size, "\"");
+            for (int i = 0; i < val->string.length && written < buf_size - 2; i++) {
+                char c = val->string.data[i];
+                switch (c) {
+                    case '"':  written += snprintf(buf+written, buf_size-written, "\\\""); break;
+                    case '\\': written += snprintf(buf+written, buf_size-written, "\\\\"); break;
+                    case '\n': written += snprintf(buf+written, buf_size-written, "\\n"); break;
+                    case '\t': written += snprintf(buf+written, buf_size-written, "\\t"); break;
+                    case '\r': written += snprintf(buf+written, buf_size-written, "\\r"); break;
+                    default:   buf[written++] = c; break;
+                }
+            }
+            written += snprintf(buf+written, buf_size-written, "\"");
+            break;
+        }
+        case VALUE_ARRAY: {
+            /* 配列の各要素が2要素配列なら → JSON object として出力 */
+            int is_kv = 1;
+            if (val->array.length > 0) {
+                for (int i = 0; i < val->array.length; i++) {
+                    Value *elem = &val->array.elements[i];
+                    if (elem->type != VALUE_ARRAY || elem->array.length != 2 ||
+                        elem->array.elements[0].type != VALUE_STRING) {
+                        is_kv = 0;
+                        break;
+                    }
+                }
+            } else {
+                is_kv = 0;
+            }
+
+            if (is_kv) {
+                buf[written++] = '{';
+                for (int i = 0; i < val->array.length && written < buf_size - 2; i++) {
+                    if (i > 0) buf[written++] = ',';
+                    Value *pair = &val->array.elements[i];
+                    written += value_to_json(&pair->array.elements[0],
+                                             buf+written, buf_size-written);
+                    buf[written++] = ':';
+                    written += value_to_json(&pair->array.elements[1],
+                                             buf+written, buf_size-written);
+                }
+                buf[written++] = '}';
+            } else {
+                buf[written++] = '[';
+                for (int i = 0; i < val->array.length && written < buf_size - 2; i++) {
+                    if (i > 0) buf[written++] = ',';
+                    written += value_to_json(&val->array.elements[i],
+                                             buf+written, buf_size-written);
+                }
+                buf[written++] = ']';
+            }
+            buf[written] = '\0';
+            break;
+        }
+        default:
+            written = snprintf(buf, buf_size, "null");
+            break;
+    }
+    return written;
+}
+
+/* JSON生成(値) → 文字列 */
+static Value fn_json_stringify(int argc, Value *argv) {
+    if (argc < 1) return hajimu_string("null");
+    char buf[HW_TEMPLATE_BUF];
+    value_to_json(&argv[0], buf, sizeof(buf));
+    return hajimu_string(buf);
 }
 
 /* --- 情報取得 --- */
@@ -2026,7 +2505,7 @@ static Value fn_server_start(int argc, Value *argv) {
 
     printf("\n");
     printf("  +==========================================+\n");
-    printf("  |   はじむウェブ v2.0 サーバー起動          |\n");
+    printf("  |   はじむウェブ v3.0 サーバー起動          |\n");
     printf("  |                                          |\n");
     printf("  |   http://localhost:%-5d                  |\n",
            g_server.port);
@@ -2145,11 +2624,22 @@ static HajimuPluginFunc functions[] = {
     {"テンプレートGET",         fn_template_get,         2, -1},
     /* レスポンスヘルパー (1) */
     {"リダイレクト応答",    fn_redirect,             2, 3},
-    /* 設定 (4) */
+    /* Cookie (2) */
+    {"Cookie設定",         fn_set_cookie,           2, 3},
+    {"Cookie削除",         fn_delete_cookie,        1, 1},
+    /* レスポンス制御 (3) */
+    {"ヘッダー設定",        fn_set_header,           2, 2},
+    {"ステータス設定",      fn_set_status,           1, 1},
+    {"コンテンツタイプ設定", fn_set_content_type,     1, 1},
+    /* JSON ユーティリティ (2) */
+    {"JSON解析",           fn_json_parse,           1, 1},
+    {"JSON生成",           fn_json_stringify,       1, 1},
+    /* 設定 (5) */
     {"静的ファイル",        fn_static_dir,           1, 1},
     {"静的キャッシュ",      fn_static_cache,         1, 1},
     {"CORS有効",           fn_cors_enable,          0, 0},
     {"CORS設定",           fn_cors_config,          1, 3},
+    {"レート制限設定",      fn_rate_limit_config,    1, 2},
 };
 
 /* ================================================================= */
@@ -2159,9 +2649,9 @@ static HajimuPluginFunc functions[] = {
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {
     static HajimuPluginInfo info = {
         .name           = "hajimu_web",
-        .version        = "2.0.0",
+        .version        = "3.0.0",
         .author         = "はじむ開発チーム",
-        .description    = "HTTP ウェブサーバー v2 — ミドルウェア・テンプレート・エラーハンドリング対応",
+        .description    = "HTTP ウェブサーバー v3 — コールバック・ミドルウェア・テンプレート・レート制限対応",
         .functions      = functions,
         .function_count = sizeof(functions) / sizeof(functions[0]),
     };
