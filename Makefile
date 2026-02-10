@@ -70,7 +70,7 @@ all: $(OUT)
 	@echo ""
 
 $(OUT): $(SRC)
-	$(CC) $(SHARED_FLAGS) $(CFLAGS) -o $@ $<
+	$(CC) $(SHARED_FLAGS) $(CFLAGS) -o $@ $< -lz -lpthread
 
 clean:
 	rm -f $(OUT)
