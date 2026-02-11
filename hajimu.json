@@ -1,7 +1,7 @@
 {
   "名前": "hajimu_web",
-  "バージョン": "5.0.0",
-  "説明": "はじむ用 HTTPウェブサーバープラグイン v5 — Express対等機能: 辞書型・スレッドプール・Keep-Alive・Chunked・Range・コンテンツネゴシエーション・Trust Proxy・パス制限MW・エラーチェーン",
+  "バージョン": "5.1.0",
+  "説明": "はじむ用 HTTPウェブサーバープラグイン v5.1 — バグ修正・スレッド安全性・Accept q値対応・新API(IP一覧/Vary/Link/Type/SendStatus/Fresh/Stale)",
   "作者": "はじむ開発チーム",
   "メイン": "hajimu_web.hjp",
   "ビルド": "make",
