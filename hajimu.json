@@ -1,7 +1,7 @@
 {
   "名前": "hajimu_web",
-  "バージョン": "5.1.0",
-  "説明": "はじむ用 HTTPウェブサーバープラグイン v5.1 — バグ修正・スレッド安全性・Accept q値対応・新API(IP一覧/Vary/Link/Type/SendStatus/Fresh/Stale)",
+  "バージョン": "5.2.0",
+  "説明": "はじむ用 HTTPウェブサーバープラグイン v5.2 — HEAD自動マッチ・セッション再生成・ログ形式・リクエストID・レスポンスタイム・Cookie構造化オプション・res.locals・req/resヘルパー・If-Modified-Since日付比較・100-continue・グレースフル停止",
   "作者": "はじむ開発チーム",
   "メイン": "hajimu_web.hjp",
   "ビルド": "make",
