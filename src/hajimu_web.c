@@ -1,21 +1,37 @@
 /**
- * hajimu_web — はじむ用 HTTP ウェブサーバープラグイン v4.0
+ * hajimu_web — はじむ用 HTTP ウェブサーバープラグイン v5.0
  *
  * Python の Flask / Node.js の Express に相当する本格的な HTTP サーバー。
  * 統一拡張子 .hjp（Hajimu Plugin）でクロスプラットフォーム対応。
  *
- * === v4.0 新機能 ===
- *   - ユーザー定義ミドルウェア（はじむ関数ミドルウェア / next() チェーン）
+ * === v5.0 新機能 ===
+ *   - Keep-Alive 持続接続ループ（実際のソケット再利用）
+ *   - マルチスレッド化（スレッドプール + コールバックミューテックス）
+ *   - 動的リダイレクト（コールバック内 res.redirect()）
+ *   - JSON解析 VALUE_DICT 統一（オブジェクト → 辞書型）
+ *   - headers VALUE_DICT 統一（全フィールド辞書アクセス可）
+ *   - パス限定ミドルウェア（app.use('/api', fn) 対応）
+ *   - Chunked Transfer Encoding（res.write() / res.end()）
+ *   - Range リクエスト（206 Partial Content / 動画シーク）
+ *   - コンテンツネゴシエーション（req.accepts()）
+ *   - エラーミドルウェアチェーン（複数エラーハンドラ）
+ *   - オプショナルパラメータ（:id? 構文）
+ *   - Trust Proxy（X-Forwarded-For / X-Forwarded-Proto）
+ *   - 複数静的ファイルディレクトリ / ディレクトリ一覧
+ *   - コールバック内テンプレート描画
+ *   - res.append() / res.location() / res.download()
+ *
+ * === v4.0 機能 ===
+ *   - ユーザー定義ミドルウェア（はじむ関数ミドルウェア）
  *   - レスポンスAPI強化（JSON送信 / ファイル送信 / テキスト送信 / HTML送信）
  *   - セッション管理（インメモリセッションストア + Cookie）
  *   - gzip 圧縮（zlib / Accept-Encoding 自動判定）
  *   - ファイルアップロード（multipart/form-data パース）
  *   - HTTPS/TLS（OpenSSL 条件コンパイル）
- *   - Keep-Alive 持続接続
  *   - SSE（Server-Sent Events / pthread）
  *   - エラーハンドリングコールバック（動的エラーハンドラ関数）
- *   - リクエストバリデーション（必須 / 長さ / メール / 数値チェック）
- *   - ルーターマウント（プレフィックス付きルート一括登録）
+ *   - リクエストバリデーション
+ *   - ルーターマウント
  *
  * === v3.0 機能 ===
  *   - コールバック関数ハンドラ（はじむ関数をルートハンドラとして使用可能）
@@ -73,6 +89,7 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
   #include <unistd.h>
   #include <sys/stat.h>
   #include <fcntl.h>
+  #include <dirent.h>
   typedef int socket_t;
   #define INVALID_SOCK (-1)
   #define close_socket close
@@ -104,6 +121,9 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
 #define HW_MAX_UPLOADS          16
 #define HW_UPLOAD_MAX_SIZE      (16 * 1024 * 1024)
 #define HW_MAX_SSE_CLIENTS      64
+#define HW_MAX_THREADS          64
+#define HW_MAX_STATIC_DIRS      8
+#define HW_MAX_ERROR_CALLBACKS  8
 
 /* HTTP メソッド */
 typedef enum {
@@ -203,6 +223,8 @@ typedef struct {
     int  (*before)(HttpRequest *req, HttpResponse *resp);
     void (*after)(HttpRequest *req, HttpResponse *resp);
     Value  callback_func;      /* MW_USER_CALLBACK 用 */
+    char   path[HW_MAX_PATH];  /* パス限定ミドルウェア (v5.0) */
+    int    has_path;           /* パス指定あり */
 } Middleware;
 
 typedef struct {
@@ -294,9 +316,9 @@ typedef struct {
     int           session_timeout;       /* 秒 (default 1800) */
     int           session_enabled;
     char          current_session_id[HW_SESSION_ID_LEN];
-    /* エラーハンドラコールバック */
-    Value         error_callback;
-    int           has_error_callback;
+    /* エラーハンドラコールバック (v5.0: 配列) */
+    Value         error_callbacks[HW_MAX_ERROR_CALLBACKS];
+    int           error_callback_count;
     /* SSE */
     SSEClient     sse_clients[HW_MAX_SSE_CLIENTS];
     int           sse_client_count;
@@ -317,10 +339,44 @@ typedef struct {
     int           upload_max_size;
     /* 現在のリクエスト参照 */
     HttpRequest  *current_req;
+    /* v5.0: スレッドプール */
+    int           max_threads;
+    int           active_threads;
+    pthread_mutex_t thread_mutex;
+    /* v5.0: コールバック保護 */
+    pthread_mutex_t callback_mutex;
+    /* v5.0: Trust Proxy */
+    int           trust_proxy;
+    /* v5.0: 複数静的ファイルディレクトリ */
+    char          static_dirs_extra[HW_MAX_STATIC_DIRS][HW_MAX_PATH];
+    int           static_dir_extra_count;
+    /* v5.0: ディレクトリ一覧 */
+    int           directory_listing;
+    /* v5.0: チャンク転送状態 */
+    int           chunked_started;
 } WebServer;
 
 static WebServer g_server = {0};
 static volatile int g_shutdown = 0;
+
+/* v5.0: スレッドプール用構造体 */
+typedef struct {
+    socket_t fd;
+    struct sockaddr_in addr;
+} ClientThreadArg;
+
+static void handle_client(socket_t client_fd, struct sockaddr_in *addr);
+
+static void *client_thread_func(void *arg) {
+    ClientThreadArg *ca = (ClientThreadArg *)arg;
+    handle_client(ca->fd, &ca->addr);
+    free(ca);
+    pthread_mutex_lock(&g_server.thread_mutex);
+    g_server.active_threads--;
+    pthread_mutex_unlock(&g_server.thread_mutex);
+    return NULL;
+}
+
 
 /* ================================================================= */
 /* ユーティリティ                                                     */
@@ -956,7 +1012,7 @@ static int match_route(const Route *route, const char *path,
     /* 完全一致 */
     if (strcmp(pattern, path) == 0) return 1;
 
-    /* パラメータ付きルート :param */
+    /* パラメータ付きルート :param / :param? (v5.0 オプショナル対応) */
     const char *pp = pattern;
     const char *rp = path;
     while (*pp && *rp) {
@@ -964,9 +1020,11 @@ static int match_route(const Route *route, const char *path,
             pp++;
             char param_name[256] = {0};
             int ni = 0;
-            while (*pp && *pp != '/' && ni < 255)
+            while (*pp && *pp != '/' && *pp != '?' && ni < 255)
                 param_name[ni++] = *pp++;
             param_name[ni] = '\0';
+            int optional = (*pp == '?');
+            if (optional) pp++;
 
             char param_val[HW_MAX_HEADER_VALUE] = {0};
             int vi = 0;
@@ -984,6 +1042,16 @@ static int match_route(const Route *route, const char *path,
             if (*pp != *rp) return 0;
             pp++;
             rp++;
+        }
+    }
+    /* 残りパターンがオプショナルパラメータのみなら一致 */
+    while (*pp == '/' || *pp == ':') {
+        if (*pp == '/') pp++;
+        if (*pp == ':') {
+            pp++;
+            while (*pp && *pp != '/' && *pp != '?') pp++;
+            if (*pp == '?') { pp++; continue; }
+            else return 0; /* 非オプショナル未充足 */
         }
     }
     return (*pp == '\0' && *rp == '\0');
@@ -1094,7 +1162,7 @@ static void send_response_obj(socket_t fd, HttpResponse *resp) {
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Date: %s\r\n"
-        "Server: hajimu_web/4.0.0\r\n"
+        "Server: hajimu_web/5.0.0\r\n"
         "Connection: %s\r\n",
         resp->status_code, status_text(resp->status_code),
         resp->content_type, resp->body_length, date,
@@ -1184,21 +1252,26 @@ static void default_error_page(int status_code, char *buf, int buf_size) {
 static Value request_to_value(const HttpRequest *req);
 
 static void send_error(socket_t fd, int status_code, const char *message) {
-    /* コールバックエラーハンドラ */
-    if (g_server.has_error_callback && hajimu_runtime_available()) {
+    /* コールバックエラーハンドラ (v5.0: 配列チェーン) */
+    if (g_server.error_callback_count > 0 && hajimu_runtime_available()) {
         Value args[3];
         args[0] = hajimu_number(status_code);
         args[1] = hajimu_string(message ? message : status_text(status_code));
         args[2] = g_server.current_req
                   ? request_to_value(g_server.current_req)
                   : hajimu_null();
-        Value result = hajimu_call(&g_server.error_callback, 3, args);
-        if (result.type == VALUE_STRING) {
-            send_response(fd, status_code,
-                "text/html; charset=utf-8",
-                result.string.data, result.string.length);
-            g_server.error_count++;
-            return;
+        for (int ei = 0; ei < g_server.error_callback_count; ei++) {
+            pthread_mutex_lock(&g_server.callback_mutex);
+            Value result = hajimu_call(&g_server.error_callbacks[ei], 3, args);
+            pthread_mutex_unlock(&g_server.callback_mutex);
+            if (result.type == VALUE_STRING) {
+                send_response(fd, status_code,
+                    "text/html; charset=utf-8",
+                    result.string.data, result.string.length);
+                __sync_fetch_and_add(&g_server.error_count, 1);
+                return;
+            }
+            /* 文字列以外 → 次のハンドラへ (next() 相当) */
         }
     }
 
@@ -1208,7 +1281,7 @@ static void send_error(socket_t fd, int status_code, const char *message) {
         if (eh->status_code == status_code || eh->status_code == 0) {
             send_response(fd, status_code,
                           eh->content_type, eh->body, eh->body_len);
-            g_server.error_count++;
+            __sync_fetch_and_add(&g_server.error_count, 1);
             return;
         }
     }
@@ -1230,7 +1303,7 @@ static void send_error(socket_t fd, int status_code, const char *message) {
                       "text/html; charset=utf-8",
                       html_buf, (int)strlen(html_buf));
     }
-    g_server.error_count++;
+    __sync_fetch_and_add(&g_server.error_count, 1);
 }
 
 /* ================================================================= */
@@ -1488,30 +1561,57 @@ static char *render_template_file(const char *filename,
 /* 静的ファイル配信（強化版）                                          */
 /* ================================================================= */
 
-static int serve_static_file(socket_t fd, const HttpRequest *req) {
-    if (g_server.static_dir[0] == '\0') return 0;
-
-    /* ディレクトリトラバーサル防止 */
-    if (strstr(req->path, "..") != NULL) {
-        send_error(fd, 403, NULL);
-        return 1;
-    }
-
+static int try_static_directory(socket_t fd, const HttpRequest *req,
+                                const char *static_dir) {
     char filepath[HW_MAX_PATH];
     const char *req_path = req->path;
     if (strcmp(req_path, "/") == 0) req_path = "/index.html";
-    snprintf(filepath, sizeof(filepath), "%s%s",
-             g_server.static_dir, req_path);
+    snprintf(filepath, sizeof(filepath), "%s%s", static_dir, req_path);
 
-    /* ディレクトリの場合 index.html を探す */
     struct stat st;
     if (stat(filepath, &st) == 0 && S_ISDIR(st.st_mode)) {
         char idx_path[HW_MAX_PATH];
         snprintf(idx_path, sizeof(idx_path), "%s/index.html", filepath);
-        if (stat(idx_path, &st) == 0)
+        if (stat(idx_path, &st) == 0) {
             snprintf(filepath, sizeof(filepath), "%s", idx_path);
-        else
+        } else if (g_server.directory_listing) {
+            /* v5.0: ディレクトリ一覧 */
+#ifndef _WIN32
+            DIR *d = opendir(filepath);
+            if (!d) return 0;
+            char html[HW_TEMPLATE_BUF];
+            int hi = snprintf(html, sizeof(html),
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                "<title>%s</title><style>body{font-family:sans-serif;"
+                "padding:20px}a{color:#007bff;text-decoration:none}"
+                "a:hover{text-decoration:underline}li{margin:4px 0}"
+                "</style></head><body><h2>%s</h2><ul>",
+                req->path, req->path);
+            if (strcmp(req->path, "/") != 0)
+                hi += snprintf(html + hi, sizeof(html) - hi,
+                    "<li><a href=\"..\">../</a></li>");
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') continue;
+                char full[HW_MAX_PATH];
+                snprintf(full, sizeof(full), "%s/%s", filepath, ent->d_name);
+                struct stat est;
+                int is_dir = (stat(full, &est) == 0 && S_ISDIR(est.st_mode));
+                hi += snprintf(html + hi, sizeof(html) - hi,
+                    "<li><a href=\"%s%s%s\">%s%s</a></li>",
+                    req->path,
+                    (req->path[strlen(req->path)-1] == '/') ? "" : "/",
+                    ent->d_name, ent->d_name, is_dir ? "/" : "");
+            }
+            closedir(d);
+            hi += snprintf(html + hi, sizeof(html) - hi,
+                "</ul><hr><p>hajimu_web/5.0.0</p></body></html>");
+            send_response(fd, 200, "text/html; charset=utf-8", html, hi);
+            return 1;
+#endif
+        } else {
             return 0;
+        }
     }
 
     FILE *f = fopen(filepath, "rb");
@@ -1535,19 +1635,61 @@ static int serve_static_file(socket_t fd, const HttpRequest *req) {
         }
     }
 
+    /* v5.0: Range リクエスト対応 */
+    const char *range_hdr = get_header(req, "Range");
+    long range_start = 0, range_end = file_size - 1;
+    int is_range = 0;
+    if (range_hdr && strncmp(range_hdr, "bytes=", 6) == 0) {
+        const char *rp = range_hdr + 6;
+        if (*rp == '-') {
+            long suffix = strtol(rp + 1, NULL, 10);
+            if (suffix > 0 && suffix <= file_size) {
+                range_start = file_size - suffix;
+                is_range = 1;
+            }
+        } else {
+            char *dash = NULL;
+            range_start = strtol(rp, &dash, 10);
+            if (dash && *dash == '-') {
+                if (*(dash+1) && *(dash+1) != ',')
+                    range_end = strtol(dash+1, NULL, 10);
+                if (range_start >= 0 && range_start < file_size &&
+                    range_end >= range_start && range_end < file_size)
+                    is_range = 1;
+            }
+        }
+    }
+
     char date[64];
     get_http_date(date, sizeof(date));
 
     char header[2048];
-    int hlen = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %ld\r\n"
-        "Date: %s\r\n"
-        "Server: hajimu_web/4.0.0\r\n"
-        "Connection: %s\r\n",
-        mime, file_size, date,
-        g_server.keep_alive_enabled ? "keep-alive" : "close");
+    int hlen;
+    if (is_range) {
+        long content_len = range_end - range_start + 1;
+        hlen = snprintf(header, sizeof(header),
+            "HTTP/1.1 206 Partial Content\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %ld\r\n"
+            "Content-Range: bytes %ld-%ld/%ld\r\n"
+            "Accept-Ranges: bytes\r\n"
+            "Date: %s\r\n"
+            "Server: hajimu_web/5.0.0\r\n"
+            "Connection: %s\r\n",
+            mime, content_len, range_start, range_end, file_size,
+            date, g_server.keep_alive_enabled ? "keep-alive" : "close");
+    } else {
+        hlen = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %ld\r\n"
+            "Accept-Ranges: bytes\r\n"
+            "Date: %s\r\n"
+            "Server: hajimu_web/5.0.0\r\n"
+            "Connection: %s\r\n",
+            mime, file_size, date,
+            g_server.keep_alive_enabled ? "keep-alive" : "close");
+    }
 
     if (g_server.static_cache_seconds > 0) {
         hlen += snprintf(header + hlen, sizeof(header) - hlen,
@@ -1563,8 +1705,6 @@ static int serve_static_file(socket_t fd, const HttpRequest *req) {
             "Access-Control-Allow-Origin: %s\r\n",
             g_server.cors_origin[0] ? g_server.cors_origin : "*");
     }
-
-    /* セキュリティミドルウェアのヘッダー */
     for (int i = 0; i < g_server.middleware_count; i++) {
         if (g_server.middlewares[i].type == MW_SECURITY &&
             g_server.middlewares[i].enabled) {
@@ -1575,16 +1715,48 @@ static int serve_static_file(socket_t fd, const HttpRequest *req) {
             break;
         }
     }
-
     hlen += snprintf(header + hlen, sizeof(header) - hlen, "\r\n");
     send(fd, header, hlen, 0);
 
-    char buf[HW_STATIC_BUF];
-    size_t nread;
-    while ((nread = fread(buf, 1, sizeof(buf), f)) > 0)
-        send(fd, buf, (int)nread, 0);
+    if (is_range) {
+        fseek(f, range_start, SEEK_SET);
+        long remaining = range_end - range_start + 1;
+        char buf[HW_STATIC_BUF];
+        while (remaining > 0) {
+            size_t to_read = remaining < (long)sizeof(buf)
+                           ? (size_t)remaining : sizeof(buf);
+            size_t nread = fread(buf, 1, to_read, f);
+            if (nread == 0) break;
+            send(fd, buf, (int)nread, 0);
+            remaining -= (long)nread;
+        }
+    } else {
+        char buf[HW_STATIC_BUF];
+        size_t nread;
+        while ((nread = fread(buf, 1, sizeof(buf), f)) > 0)
+            send(fd, buf, (int)nread, 0);
+    }
     fclose(f);
     return 1;
+}
+
+static int serve_static_file(socket_t fd, const HttpRequest *req) {
+    if (g_server.static_dir[0] == '\0' &&
+        g_server.static_dir_extra_count == 0) return 0;
+    /* ディレクトリトラバーサル防止 */
+    if (strstr(req->path, "..") != NULL) {
+        send_error(fd, 403, NULL);
+        return 1;
+    }
+    /* プライマリディレクトリ */
+    if (g_server.static_dir[0] && try_static_directory(fd, req, g_server.static_dir))
+        return 1;
+    /* v5.0: 追加ディレクトリ */
+    for (int i = 0; i < g_server.static_dir_extra_count; i++) {
+        if (try_static_directory(fd, req, g_server.static_dirs_extra[i]))
+            return 1;
+    }
+    return 0;
 }
 
 /* ================================================================= */
@@ -1694,8 +1866,16 @@ static int run_middlewares_before(HttpRequest *req, HttpResponse *resp) {
                 if (hajimu_runtime_available() &&
                     (mw->callback_func.type == VALUE_FUNCTION ||
                      mw->callback_func.type == VALUE_BUILTIN)) {
+                    /* v5.0: パス限定チェック */
+                    if (mw->has_path &&
+                        strncmp(req->path, mw->path, strlen(mw->path)) != 0)
+                        break; /* パス不一致 → スキップ */
                     Value req_val = request_to_value(req);
+                    pthread_mutex_lock(&g_server.callback_mutex);
+                    g_server.current_resp = resp;
+                    g_server.current_req = req;
                     Value rv = hajimu_call(&mw->callback_func, 1, &req_val);
+                    pthread_mutex_unlock(&g_server.callback_mutex);
                     if (rv.type == VALUE_BOOL && !rv.boolean) result = 1;
                 }
                 break;
@@ -1737,13 +1917,19 @@ static Value request_to_value(const HttpRequest *req) {
     /* [4] client_ip */
     hajimu_array_push(&arr, hajimu_string(req->client_ip));
 
-    /* [5] headers [[key, value], ...] */
-    Value headers = hajimu_array();
-    for (int i = 0; i < req->header_count; i++) {
-        Value pair = hajimu_array();
-        hajimu_array_push(&pair, hajimu_string(req->headers[i].key));
-        hajimu_array_push(&pair, hajimu_string(req->headers[i].value));
-        hajimu_array_push(&headers, pair);
+    /* [5] headers {key: value, ...} — 辞書型 (v5.0) */
+    Value headers;
+    memset(&headers, 0, sizeof(headers));
+    headers.type = VALUE_DICT;
+    if (req->header_count > 0) {
+        headers.dict.keys = (char **)calloc(req->header_count, sizeof(char *));
+        headers.dict.values = (Value *)calloc(req->header_count, sizeof(Value));
+        headers.dict.length = req->header_count;
+        headers.dict.capacity = req->header_count;
+        for (int i = 0; i < req->header_count; i++) {
+            headers.dict.keys[i] = strdup(req->headers[i].key);
+            headers.dict.values[i] = hajimu_string(req->headers[i].value);
+        }
     }
     hajimu_array_push(&arr, headers);
 
@@ -1841,6 +2027,28 @@ static Value request_to_value(const HttpRequest *req) {
     /* [12] session_id */
     hajimu_array_push(&arr, hajimu_string(req->session_id));
 
+    /* [13] hostname (v5.0) */
+    const char *host_hdr = get_header(req, "Host");
+    char hostname[256] = {0};
+    if (host_hdr) {
+        snprintf(hostname, sizeof(hostname), "%s", host_hdr);
+        char *colon = strchr(hostname, ':');
+        if (colon) *colon = '\0';
+    }
+    hajimu_array_push(&arr, hajimu_string(hostname));
+
+    /* [14] protocol (v5.0) */
+    const char *proto = "http";
+    if (g_server.trust_proxy) {
+        const char *fp = get_header(req, "X-Forwarded-Proto");
+        if (fp) proto = fp;
+    }
+    if (g_server.tls_enabled) proto = "https";
+    hajimu_array_push(&arr, hajimu_string(proto));
+
+    /* [15] secure (v5.0) */
+    hajimu_array_push(&arr, hajimu_bool(strcmp(proto, "https") == 0));
+
     return arr;
 }
 
@@ -1849,6 +2057,11 @@ static Value request_to_value(const HttpRequest *req) {
 /* ================================================================= */
 
 static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
+    int ka_request_count = 0;
+    int ka_max = g_server.keep_alive_max_requests > 0
+              ? g_server.keep_alive_max_requests : 100;
+
+  ka_loop: ;
     char client_ip[64] = {0};
     inet_ntop(AF_INET, &addr->sin_addr, client_ip, sizeof(client_ip));
 
@@ -1916,12 +2129,24 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
         close_socket(client_fd);
         return;
     }
+    /* v5.0: Trust Proxy — X-Forwarded-For */
+    if (g_server.trust_proxy) {
+        const char *xff = get_header(&req, "X-Forwarded-For");
+        if (xff) {
+            char xff_buf[256];
+            snprintf(xff_buf, sizeof(xff_buf), "%s", xff);
+            char *comma = strchr(xff_buf, ',');
+            if (comma) *comma = '\0';
+            char *xp = xff_buf; while (*xp == ' ') xp++;
+            snprintf(client_ip, sizeof(client_ip), "%s", xp);
+        }
+    }
     snprintf(req.client_ip, sizeof(req.client_ip), "%s", client_ip);
 
     /* ボディ自動解析 */
     auto_parse_body(&req);
     parse_multipart_body(&req);
-    g_server.total_requests++;
+    __sync_fetch_and_add(&g_server.total_requests, 1);
 
     /* セッション処理 */
     if (g_server.session_enabled) {
@@ -1992,8 +2217,12 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                 return;
             }
         } else if (route->has_callback && hajimu_runtime_available()) {
-            /* === コールバック関数ハンドラ === */
+            /* === コールバック関数ハンドラ (v5.0: mutex保護) === */
             Value req_val = request_to_value(&req);
+            pthread_mutex_lock(&g_server.callback_mutex);
+            g_server.current_resp = &resp;
+            g_server.current_req  = &req;
+            g_server.current_fd   = client_fd;
             Value result  = hajimu_call(&route->callback_func, 1, &req_val);
 
             /* レスポンスがまだ送信されていない場合 */
@@ -2036,6 +2265,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                 if (resp.body == NULL) {
                     response_set_body(&resp, "OK", 2);
                 }
+                pthread_mutex_unlock(&g_server.callback_mutex);
                 /* gzip 圧縮 */
                 if (should_compress(&req, &resp)) {
                     char *gz = NULL; int gz_len = 0;
@@ -2117,6 +2347,16 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
     if (resp.body) free(resp.body);
     if (req.body)  free(req.body);
     free(raw);
+
+    /* v5.0: Keep-Alive ループ判定 */
+    if (g_server.keep_alive_enabled && !g_shutdown) {
+        const char *conn_hdr = get_header(&req, "Connection");
+        ka_request_count++;
+        if (ka_request_count < ka_max &&
+            (conn_hdr == NULL || strcasecmp(conn_hdr, "close") != 0)) {
+            goto ka_loop;
+        }
+    }
     close_socket(client_fd);
 }
 
@@ -2157,7 +2397,17 @@ static Value fn_server_create(int argc, Value *argv) {
     g_server.port = port;
     g_server.active_group = -1;
     g_server.upload_max_size = HW_UPLOAD_MAX_SIZE;
+    g_server.max_threads = 0;  /* デフォルト同期モード（ランタイム非スレッドセーフ） */
     pthread_mutex_init(&g_server.sse_mutex, NULL);
+    pthread_mutex_init(&g_server.thread_mutex, NULL);
+    /* v5.0: recursive mutex for callback protection */
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&g_server.callback_mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
     g_shutdown = 0;
     return hajimu_bool(true);
 }
@@ -2789,28 +3039,46 @@ static Value parse_json_value(const char **p) {
     if (**p == '"') {
         return parse_json_string(p);
     } else if (**p == '{') {
-        /* オブジェクト → 配列の配列 [[key, value], ...] */
+        /* オブジェクト → VALUE_DICT (v5.0) */
         (*p)++;
-        Value arr = hajimu_array();
         skip_ws(p);
-        if (**p == '}') { (*p)++; return arr; }
-        while (**p) {
-            skip_ws(p);
-            Value key = parse_json_string(p);
-            skip_ws(p);
-            if (**p == ':') (*p)++;
-            Value val = parse_json_value(p);
-            Value pair = hajimu_array();
-            hajimu_array_push(&pair, key);
-            hajimu_array_push(&pair, val);
-            hajimu_array_push(&arr, pair);
-            skip_ws(p);
-            if (**p == ',') (*p)++;
-            else break;
+        /* まずキー・値を一時配列に収集 */
+        char *tmp_keys[256];
+        Value tmp_vals[256];
+        int tmp_count = 0;
+        if (**p != '}') {
+            while (**p && tmp_count < 256) {
+                skip_ws(p);
+                Value key = parse_json_string(p);
+                skip_ws(p);
+                if (**p == ':') (*p)++;
+                Value val = parse_json_value(p);
+                tmp_keys[tmp_count] = key.string.data
+                    ? strdup(key.string.data) : strdup("");
+                tmp_vals[tmp_count] = val;
+                tmp_count++;
+                skip_ws(p);
+                if (**p == ',') (*p)++;
+                else break;
+            }
         }
         skip_ws(p);
         if (**p == '}') (*p)++;
-        return arr;
+        /* VALUE_DICT 構築 */
+        Value dict;
+        memset(&dict, 0, sizeof(dict));
+        dict.type = VALUE_DICT;
+        if (tmp_count > 0) {
+            dict.dict.keys = (char **)calloc(tmp_count, sizeof(char *));
+            dict.dict.values = (Value *)calloc(tmp_count, sizeof(Value));
+            dict.dict.length = tmp_count;
+            dict.dict.capacity = tmp_count;
+            for (int i = 0; i < tmp_count; i++) {
+                dict.dict.keys[i] = tmp_keys[i];
+                dict.dict.values[i] = tmp_vals[i];
+            }
+        }
+        return dict;
     } else if (**p == '[') {
         (*p)++;
         Value arr = hajimu_array();
@@ -3049,7 +3317,7 @@ static Value fn_server_start(int argc, Value *argv) {
 
     printf("\n");
     printf("  +==========================================+\n");
-    printf("  |   はじむウェブ v4.0 サーバー起動          |\n");
+    printf("  |   はじむウェブ v5.0 サーバー起動          |\n");
     printf("  |                                          |\n");
     printf("  |   http://localhost:%-5d                  |\n",
            g_server.port);
@@ -3066,7 +3334,7 @@ static Value fn_server_start(int argc, Value *argv) {
     printf("  +==========================================+\n");
     printf("\n");
 
-    /* メインイベントループ */
+    /* メインイベントループ (v5.0: スレッドプール) */
     while (!g_shutdown) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -3076,7 +3344,29 @@ static Value fn_server_start(int argc, Value *argv) {
             if (g_shutdown) break;
             continue;
         }
-        handle_client(client_fd, &client_addr);
+        /* スレッド数チェック */
+        pthread_mutex_lock(&g_server.thread_mutex);
+        int can_thread = (g_server.active_threads < g_server.max_threads);
+        if (can_thread) g_server.active_threads++;
+        pthread_mutex_unlock(&g_server.thread_mutex);
+        if (can_thread) {
+            ClientThreadArg *ca = (ClientThreadArg *)malloc(sizeof(ClientThreadArg));
+            ca->fd = client_fd;
+            ca->addr = client_addr;
+            pthread_t th;
+            if (pthread_create(&th, NULL, client_thread_func, ca) == 0) {
+                pthread_detach(th);
+            } else {
+                handle_client(client_fd, &client_addr);
+                free(ca);
+                pthread_mutex_lock(&g_server.thread_mutex);
+                g_server.active_threads--;
+                pthread_mutex_unlock(&g_server.thread_mutex);
+            }
+        } else {
+            /* フォールバック: 同期処理 */
+            handle_client(client_fd, &client_addr);
+        }
     }
 
     /* クリーンアップ */
@@ -3096,6 +3386,12 @@ static Value fn_server_start(int argc, Value *argv) {
     }
     pthread_mutex_unlock(&g_server.sse_mutex);
     pthread_mutex_destroy(&g_server.sse_mutex);
+    pthread_mutex_destroy(&g_server.thread_mutex);
+    pthread_mutex_destroy(&g_server.callback_mutex);
+
+    /* スレッド完了待ち */
+    for (int wait = 0; wait < 50 && g_server.active_threads > 0; wait++)
+        usleep(100000); /* 100ms */
 
     for (int i = 0; i < g_server.route_count; i++) {
         if (g_server.routes[i].static_body) {
@@ -3146,11 +3442,20 @@ static Value fn_is_running(int argc, Value *argv) {
 
 /* --- ユーザー定義ミドルウェア --- */
 
-/* 使用(関数) — ユーザー定義ミドルウェアを登録 */
+/* 使用(関数) or 使用(パス, 関数) — ユーザー定義ミドルウェアを登録 (v5.0: パス限定) */
 static Value fn_use(int argc, Value *argv) {
-    if (argc < 1 || (argv[0].type != VALUE_FUNCTION &&
-                     argv[0].type != VALUE_BUILTIN))
+    Value *fn_arg = NULL;
+    const char *path = NULL;
+    if (argc >= 2 && argv[0].type == VALUE_STRING &&
+        (argv[1].type == VALUE_FUNCTION || argv[1].type == VALUE_BUILTIN)) {
+        path = argv[0].string.data;
+        fn_arg = &argv[1];
+    } else if (argc >= 1 &&
+               (argv[0].type == VALUE_FUNCTION || argv[0].type == VALUE_BUILTIN)) {
+        fn_arg = &argv[0];
+    } else {
         return hajimu_bool(false);
+    }
     if (g_server.middleware_count >= HW_MAX_MIDDLEWARES)
         return hajimu_bool(false);
 
@@ -3158,9 +3463,16 @@ static Value fn_use(int argc, Value *argv) {
     memset(mw, 0, sizeof(*mw));
     mw->type = MW_USER_CALLBACK;
     mw->enabled = 1;
-    mw->callback_func = argv[0];
+    mw->callback_func = *fn_arg;
+    if (path) {
+        snprintf(mw->path, sizeof(mw->path), "%s", path);
+        mw->has_path = 1;
+    }
     snprintf(mw->name, sizeof(mw->name), "user_%d", g_server.middleware_count);
-    printf("[hajimu_web] ユーザーミドルウェア追加\n");
+    if (path)
+        printf("[hajimu_web] ユーザーミドルウェア追加: %s\n", path);
+    else
+        printf("[hajimu_web] ユーザーミドルウェア追加\n");
     return hajimu_bool(true);
 }
 
@@ -3327,13 +3639,14 @@ static Value fn_sse_broadcast(int argc, Value *argv) {
 
 /* --- エラーハンドラコールバック --- */
 
-/* エラーハンドラ(関数) */
+/* エラーハンドラ(関数) — v5.0: 複数チェーン */
 static Value fn_error_handler(int argc, Value *argv) {
     if (argc < 1 || (argv[0].type != VALUE_FUNCTION &&
                      argv[0].type != VALUE_BUILTIN))
         return hajimu_bool(false);
-    g_server.error_callback = argv[0];
-    g_server.has_error_callback = 1;
+    if (g_server.error_callback_count >= HW_MAX_ERROR_CALLBACKS)
+        return hajimu_bool(false);
+    g_server.error_callbacks[g_server.error_callback_count++] = argv[0];
     return hajimu_bool(true);
 }
 
@@ -3496,8 +3809,316 @@ static Value fn_mount(int argc, Value *argv) {
     return hajimu_number(count);
 }
 
+
 /* ================================================================= */
-/* 関数テーブル（v4.0 全機能）                                              */
+/* v5.0 新プラグイン関数                                               */
+/* ================================================================= */
+
+/* --- 動的リダイレクト (コールバック内) --- */
+/* リダイレクト(URL) or リダイレクト(URL, ステータス) */
+static Value fn_dynamic_redirect(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+    int status = 302;
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER)
+        status = (int)argv[1].number;
+    resp->status_code = status;
+    response_set_header(resp, "Location", argv[0].string.data);
+    char body[512];
+    int blen = snprintf(body, sizeof(body),
+        "<!DOCTYPE html><html><body>"
+        "<p>Redirecting to <a href=\"%s\">%s</a></p>"
+        "</body></html>",
+        argv[0].string.data, argv[0].string.data);
+    response_set_body(resp, body, blen);
+    return hajimu_bool(true);
+}
+
+/* --- コールバック内テンプレート描画 --- */
+/* 描画(ファイル名, キー1, 値1, ...) */
+static Value fn_render(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+
+    TemplateVar vars[HW_MAX_TEMPLATE_VARS];
+    int var_count = 0;
+    for (int i = 1; i + 1 < argc && var_count < HW_MAX_TEMPLATE_VARS; i += 2) {
+        if (argv[i].type == VALUE_STRING && argv[i+1].type == VALUE_STRING) {
+            snprintf(vars[var_count].key, 256, "%s", argv[i].string.data);
+            snprintf(vars[var_count].value, HW_MAX_HEADER_VALUE,
+                     "%s", argv[i+1].string.data);
+            var_count++;
+        }
+    }
+    char *output = render_template_file(argv[0].string.data, vars, var_count);
+    if (!output) return hajimu_bool(false);
+    snprintf(resp->content_type, sizeof(resp->content_type),
+             "text/html; charset=utf-8");
+    response_set_body(resp, output, (int)strlen(output));
+    free(output);
+    return hajimu_bool(true);
+}
+
+/* --- Chunked Transfer Encoding --- */
+/* 書き込み(データ) — チャンク転送モードでデータを送信 */
+static Value fn_write_chunk(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    HttpResponse *resp = g_server.current_resp;
+    socket_t fd = g_server.current_fd;
+    if (!resp || fd == INVALID_SOCK) return hajimu_bool(false);
+
+    if (!resp->sent) {
+        /* 最初の書き込み: ヘッダーを送信 */
+        resp->sent = 1;
+        char date[64];
+        get_http_date(date, sizeof(date));
+        char hdr[2048];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Date: %s\r\n"
+            "Server: hajimu_web/5.0.0\r\n"
+            "Connection: %s\r\n",
+            resp->status_code, status_text(resp->status_code),
+            resp->content_type, date,
+            g_server.keep_alive_enabled ? "keep-alive" : "close");
+        for (int i = 0; i < resp->header_count; i++)
+            hlen += snprintf(hdr + hlen, sizeof(hdr) - hlen,
+                "%s: %s\r\n", resp->headers[i].key, resp->headers[i].value);
+        hlen += snprintf(hdr + hlen, sizeof(hdr) - hlen, "\r\n");
+        send(fd, hdr, hlen, 0);
+        g_server.chunked_started = 1;
+    }
+    /* チャンクデータ送信 */
+    char chunk_hdr[32];
+    int ch = snprintf(chunk_hdr, sizeof(chunk_hdr), "%x\r\n",
+                      argv[0].string.length);
+    send(fd, chunk_hdr, ch, 0);
+    send(fd, argv[0].string.data, argv[0].string.length, 0);
+    send(fd, "\r\n", 2, 0);
+    return hajimu_bool(true);
+}
+
+/* 終了(データ?) — チャンク転送を終了 */
+static Value fn_end_chunk(int argc, Value *argv) {
+    HttpResponse *resp = g_server.current_resp;
+    socket_t fd = g_server.current_fd;
+    if (!resp || fd == INVALID_SOCK) return hajimu_bool(false);
+
+    if (argc >= 1 && argv[0].type == VALUE_STRING)
+        fn_write_chunk(argc, argv);
+
+    /* 終端チャンク */
+    send(fd, "0\r\n\r\n", 5, 0);
+    resp->sent = 1;
+    g_server.chunked_started = 0;
+    return hajimu_bool(true);
+}
+
+/* --- コンテンツネゴシエーション --- */
+/* 受入確認(タイプ) — Accept ヘッダーに指定タイプが含まれるか */
+static Value fn_accepts(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    HttpRequest *req = g_server.current_req;
+    if (!req) return hajimu_bool(false);
+    const char *accept = get_header(req, "Accept");
+    if (!accept) return hajimu_bool(false);
+    const char *type = argv[0].string.data;
+    /* 完全一致 or サブタイプワイルドカード */
+    if (strstr(accept, type)) return hajimu_bool(true);
+    if (strstr(accept, "*/*")) return hajimu_bool(true);
+    /* メジャータイプチェック (e.g. text/star for text/html) */
+    char major[64];
+    snprintf(major, sizeof(major), "%s", type);
+    char *slash = strchr(major, '/');
+    if (slash) {
+        snprintf(slash, sizeof(major) - (slash - major), "/*");
+        if (strstr(accept, major)) return hajimu_bool(true);
+    }
+    return hajimu_bool(false);
+}
+
+/* フォーマット応答(配列) — Content Negotiation で応答切替
+   配列 = [["text/html", コールバック], ["application/json", コールバック], ...] */
+static Value fn_format(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_ARRAY) return hajimu_bool(false);
+    HttpRequest *req = g_server.current_req;
+    if (!req) return hajimu_bool(false);
+    const char *accept = get_header(req, "Accept");
+    if (!accept) accept = "*/*";
+
+    for (int i = 0; i < argv[0].array.length; i++) {
+        Value *entry = &argv[0].array.elements[i];
+        if (entry->type != VALUE_ARRAY || entry->array.length < 2) continue;
+        if (entry->array.elements[0].type != VALUE_STRING) continue;
+        const char *type = entry->array.elements[0].string.data;
+        if (strstr(accept, type) || strstr(accept, "*/*")) {
+            Value *handler = &entry->array.elements[1];
+            if (handler->type == VALUE_FUNCTION || handler->type == VALUE_BUILTIN) {
+                HttpResponse *resp = g_server.current_resp;
+                if (resp)
+                    snprintf(resp->content_type, sizeof(resp->content_type),
+                             "%s", type);
+                Value rv = hajimu_call(handler, 0, NULL);
+                return rv;
+            } else if (handler->type == VALUE_STRING) {
+                return *handler;
+            }
+        }
+    }
+    return hajimu_bool(false);
+}
+
+/* --- ヘッダーユーティリティ --- */
+
+/* ヘッダー追加(キー, 値) — 既存ヘッダーにカンマ区切りで追記 */
+static Value fn_append_header(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+    /* 既存ヘッダー検索 */
+    for (int i = 0; i < resp->header_count; i++) {
+        if (strcasecmp(resp->headers[i].key, argv[0].string.data) == 0) {
+            char combined[HW_MAX_HEADER_VALUE];
+            snprintf(combined, sizeof(combined), "%s, %s",
+                     resp->headers[i].value, argv[1].string.data);
+            snprintf(resp->headers[i].value, HW_MAX_HEADER_VALUE, "%s", combined);
+            return hajimu_bool(true);
+        }
+    }
+    /* 新規追加 */
+    response_set_header(resp, argv[0].string.data, argv[1].string.data);
+    return hajimu_bool(true);
+}
+
+/* Location設定(URL) */
+static Value fn_location(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+    response_set_header(resp, "Location", argv[0].string.data);
+    return hajimu_bool(true);
+}
+
+/* ダウンロード(パス, ファイル名?) — Content-Disposition: attachment */
+static Value fn_download(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    HttpResponse *resp = g_server.current_resp;
+    if (!resp) return hajimu_bool(false);
+    FILE *f = fopen(argv[0].string.data, "rb");
+    if (!f) return hajimu_bool(false);
+    fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > HW_MAX_BODY) { fclose(f); return hajimu_bool(false); }
+    char *data = (char *)malloc(fsize);
+    if (!data) { fclose(f); return hajimu_bool(false); }
+    fread(data, 1, fsize, f); fclose(f);
+    const char *mime = get_mime_type(argv[0].string.data);
+    snprintf(resp->content_type, sizeof(resp->content_type), "%s", mime);
+    /* ファイル名決定 */
+    const char *dl_name = argv[0].string.data;
+    if (argc >= 2 && argv[1].type == VALUE_STRING)
+        dl_name = argv[1].string.data;
+    else {
+        const char *sl = strrchr(dl_name, '/');
+        if (sl) dl_name = sl + 1;
+    }
+    char cd[512];
+    snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", dl_name);
+    response_set_header(resp, "Content-Disposition", cd);
+    response_set_body(resp, data, (int)fsize);
+    free(data);
+    return hajimu_bool(true);
+}
+
+/* --- ホスト名・プロトコル取得 --- */
+
+/* ホスト名取得() */
+static Value fn_hostname(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    HttpRequest *req = g_server.current_req;
+    if (!req) return hajimu_string("");
+    const char *host = get_header(req, "Host");
+    if (!host) return hajimu_string("");
+    char hn[256];
+    snprintf(hn, sizeof(hn), "%s", host);
+    char *colon = strchr(hn, ':');
+    if (colon) *colon = '\0';
+    return hajimu_string(hn);
+}
+
+/* プロトコル取得() */
+static Value fn_protocol(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    if (g_server.tls_enabled) return hajimu_string("https");
+    if (g_server.trust_proxy && g_server.current_req) {
+        const char *fp = get_header(g_server.current_req, "X-Forwarded-Proto");
+        if (fp) return hajimu_string(fp);
+    }
+    return hajimu_string("http");
+}
+
+/* 安全確認() — HTTPS かどうか */
+static Value fn_is_secure(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    Value proto = fn_protocol(0, NULL);
+    return hajimu_bool(proto.type == VALUE_STRING &&
+                       strcmp(proto.string.data, "https") == 0);
+}
+
+/* --- 設定関数 --- */
+
+/* 静的ファイル追加(パス) — 追加の静的ファイルディレクトリ */
+static Value fn_static_dir_add(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_bool(false);
+    if (g_server.static_dir_extra_count >= HW_MAX_STATIC_DIRS)
+        return hajimu_bool(false);
+    int idx = g_server.static_dir_extra_count++;
+    snprintf(g_server.static_dirs_extra[idx], HW_MAX_PATH,
+             "%s", argv[0].string.data);
+    int len = (int)strlen(g_server.static_dirs_extra[idx]);
+    if (len > 0 && g_server.static_dirs_extra[idx][len-1] == '/')
+        g_server.static_dirs_extra[idx][len-1] = '\0';
+    printf("[hajimu_web] 追加静的ファイル: %s\n", g_server.static_dirs_extra[idx]);
+    return hajimu_bool(true);
+}
+
+/* ディレクトリ一覧設定(有効) */
+static Value fn_directory_listing(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_BOOL) return hajimu_bool(false);
+    g_server.directory_listing = argv[0].boolean ? 1 : 0;
+    return hajimu_bool(true);
+}
+
+/* 信頼プロキシ(有効) */
+static Value fn_trust_proxy(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_BOOL) return hajimu_bool(false);
+    g_server.trust_proxy = argv[0].boolean ? 1 : 0;
+    return hajimu_bool(true);
+}
+
+/* 最大スレッド数(数) */
+static Value fn_max_threads(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_NUMBER) return hajimu_bool(false);
+    int n = (int)argv[0].number;
+    if (n < 1) n = 1;
+    if (n > 256) n = 256;
+    g_server.max_threads = n;
+    return hajimu_bool(true);
+}
+
+/* ================================================================= */
+/* 関数テーブル（v5.0 全機能）                                              */
 /* ================================================================= */
 
 static HajimuPluginFunc functions[] = {
@@ -3534,8 +4155,9 @@ static HajimuPluginFunc functions[] = {
     {"テンプレート描画",         fn_template_render,      1, -1},
     {"テンプレート文字列",       fn_template_string,      1, -1},
     {"テンプレートGET",         fn_template_get,         2, -1},
-    /* レスポンスヘルパー (1) */
+    /* レスポンスヘルパー (2) */
     {"リダイレクト応答",    fn_redirect,             2, 3},
+    {"リダイレクト",        fn_dynamic_redirect,     1, 2},
     /* Cookie (2) */
     {"Cookie設定",         fn_set_cookie,           2, 3},
     {"Cookie削除",         fn_delete_cookie,        1, 1},
@@ -3553,7 +4175,7 @@ static HajimuPluginFunc functions[] = {
     {"CORS設定",           fn_cors_config,          1, 3},
     {"レート制限設定",      fn_rate_limit_config,    1, 2},
     /* v4.0 ユーザー定義ミドルウェア (1) */
-    {"使用",               fn_use,                  1, 1},
+    {"使用",               fn_use,                  1, 2},
     /* v4.0 レスポンスAPI (4) */
     {"JSON送信",           fn_json_send,            1, 1},
     {"テキスト送信",        fn_text_send,            1, 1},
@@ -3585,6 +4207,28 @@ static HajimuPluginFunc functions[] = {
     {"アップロード保存",        fn_upload_save,      1, 2},
     /* v4.0 ルーターマウント (1) */
     {"マウント",            fn_mount,                2, 2},
+    /* v5.0 テンプレート描画 (1) */
+    {"描画",               fn_render,               1, -1},
+    /* v5.0 Chunked Transfer (2) */
+    {"書き込み",            fn_write_chunk,          1, 1},
+    {"応答終了",            fn_end_chunk,            0, 1},
+    /* v5.0 コンテンツネゴシエーション (2) */
+    {"受入確認",            fn_accepts,              1, 1},
+    {"フォーマット応答",     fn_format,               1, 1},
+    /* v5.0 ヘッダーユーティリティ (2) */
+    {"ヘッダー追加",        fn_append_header,        2, 2},
+    {"Location設定",       fn_location,             1, 1},
+    /* v5.0 ダウンロード (1) */
+    {"ダウンロード",        fn_download,             1, 2},
+    /* v5.0 ホスト・プロトコル (3) */
+    {"ホスト名取得",        fn_hostname,             0, 0},
+    {"プロトコル取得",      fn_protocol,             0, 0},
+    {"安全確認",            fn_is_secure,            0, 0},
+    /* v5.0 設定 (4) */
+    {"静的ファイル追加",    fn_static_dir_add,       1, 1},
+    {"ディレクトリ一覧",    fn_directory_listing,    1, 1},
+    {"信頼プロキシ",        fn_trust_proxy,          1, 1},
+    {"最大スレッド数",      fn_max_threads,          1, 1},
 };
 
 /* ================================================================= */
@@ -3594,9 +4238,9 @@ static HajimuPluginFunc functions[] = {
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {
     static HajimuPluginInfo info = {
         .name           = "hajimu_web",
-        .version        = "4.0.0",
+        .version        = "5.0.0",
         .author         = "はじむ開発チーム",
-        .description    = "HTTP ウェブサーバー v4 — ユーザーMW・セッション・圧縮・SSE・アップロード・Keep-Alive対応",
+        .description    = "HTTP ウェブサーバー v5 — スレッドプール・Keep-Alive・Chunked・Range・コンテンツネゴシエーション・全Express機能対応",
         .functions      = functions,
         .function_count = sizeof(functions) / sizeof(functions[0]),
     };
