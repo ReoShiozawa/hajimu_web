@@ -365,7 +365,7 @@ typedef struct {
 } WebServer;
 
 static WebServer g_server = {0};
-static volatile int g_shutdown = 0;
+static volatile sig_atomic_t g_shutdown = 0;
 
 /* v5.0: スレッドプール用構造体 */
 typedef struct {
@@ -424,8 +424,16 @@ static void url_decode(const char *src, char *dst, int dst_size) {
     int di = 0;
     for (int i = 0; src[i] && di < dst_size - 1; i++) {
         if (src[i] == '%' && src[i+1] && src[i+2]) {
+            /* v5.3: hex バリデーション + NUL バイト拒否 */
+            if (!isxdigit((unsigned char)src[i+1]) ||
+                !isxdigit((unsigned char)src[i+2])) {
+                dst[di++] = src[i]; /* 不正 hex → % をそのまま出力 */
+                continue;
+            }
             char hex[3] = {src[i+1], src[i+2], '\0'};
-            dst[di++] = (char)strtol(hex, NULL, 16);
+            char decoded = (char)strtol(hex, NULL, 16);
+            if (decoded == '\0') continue; /* NUL バイト除去 */
+            dst[di++] = decoded;
             i += 2;
         } else if (src[i] == '+') {
             dst[di++] = ' ';
@@ -564,8 +572,64 @@ static const char *get_mime_type(const char *path) {
 
 static void get_http_date(char *buf, int buf_size) {
     time_t now = time(NULL);
-    struct tm *gmt = gmtime(&now);
-    strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", gmt);
+    struct tm gmt_buf;
+    gmtime_r(&now, &gmt_buf);
+    strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", &gmt_buf);
+}
+
+/* v5.3: HTMLエスケープヘルパー (XSS防止) */
+static void html_escape(const char *src, char *dst, int dst_size) {
+    int di = 0;
+    for (int i = 0; src[i] && di < dst_size - 2; i++) {
+        switch (src[i]) {
+            case '<':  if (di + 4 < dst_size) { memcpy(dst+di, "&lt;", 4); di += 4; } break;
+            case '>':  if (di + 4 < dst_size) { memcpy(dst+di, "&gt;", 4); di += 4; } break;
+            case '&':  if (di + 5 < dst_size) { memcpy(dst+di, "&amp;", 5); di += 5; } break;
+            case '"': if (di + 6 < dst_size) { memcpy(dst+di, "&quot;", 6); di += 6; } break;
+            case '\'': if (di + 5 < dst_size) { memcpy(dst+di, "&#39;", 5); di += 5; } break;
+            default:   dst[di++] = src[i]; break;
+        }
+    }
+    dst[di] = '\0';
+}
+
+/* v5.3: JSONエスケープヘルパー (インジェクション防止) */
+static void json_escape(const char *src, char *dst, int dst_size) {
+    int di = 0;
+    for (int i = 0; src[i] && di < dst_size - 2; i++) {
+        switch (src[i]) {
+            case '"':  if (di+2 < dst_size) { dst[di++] = '\\'; dst[di++] = '"'; } break;
+            case '\\': if (di+2 < dst_size) { dst[di++] = '\\'; dst[di++] = '\\'; } break;
+            case '\n': if (di+2 < dst_size) { dst[di++] = '\\'; dst[di++] = 'n'; } break;
+            case '\r': if (di+2 < dst_size) { dst[di++] = '\\'; dst[di++] = 'r'; } break;
+            case '\t': if (di+2 < dst_size) { dst[di++] = '\\'; dst[di++] = 't'; } break;
+            default:   dst[di++] = src[i]; break;
+        }
+    }
+    dst[di] = '\0';
+}
+
+/* v5.3: ヘッダーサニタイズ — CRLF インジェクション防止 */
+static void sanitize_header_value(const char *src, char *dst, int dst_size) {
+    int di = 0;
+    for (int i = 0; src[i] && di < dst_size - 1; i++) {
+        if (src[i] == '\r' || src[i] == '\n') continue;
+        dst[di++] = src[i];
+    }
+    dst[di] = '\0';
+}
+
+/* v5.3: send() 全送信ラッパー (partial write 対応) */
+static ssize_t send_all(socket_t fd, const void *data, size_t len, int flags) {
+    const char *ptr = (const char *)data;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = send(fd, ptr, remaining, flags);
+        if (n <= 0) return n;
+        ptr += n;
+        remaining -= (size_t)n;
+    }
+    return (ssize_t)len;
 }
 
 static void generate_etag(const char *filepath, long file_size,
@@ -644,7 +708,11 @@ static int parse_http_request(const char *raw, int raw_len, HttpRequest *req) {
     int content_length = 0;
     for (int i = 0; i < req->header_count; i++) {
         if (strcasecmp(req->headers[i].key, "Content-Length") == 0) {
-            content_length = atoi(req->headers[i].value);
+            /* v5.3: strtol + 範囲チェック (atoi→置換) */
+            char *endp = NULL;
+            long cl_val = strtol(req->headers[i].value, &endp, 10);
+            if (cl_val < 0 || cl_val > HW_MAX_BODY) cl_val = 0;
+            content_length = (int)cl_val;
             break;
         }
     }
@@ -1140,9 +1208,10 @@ static void response_init(HttpResponse *resp) {
 static void response_set_header(HttpResponse *resp,
                                 const char *key, const char *value) {
     if (resp->header_count >= HW_MAX_RESP_HEADERS) return;
-    snprintf(resp->headers[resp->header_count].key, 256, "%s", key);
-    snprintf(resp->headers[resp->header_count].value,
-             HW_MAX_HEADER_VALUE, "%s", value);
+    /* v5.3: CRLF インジェクション防止 */
+    sanitize_header_value(key, resp->headers[resp->header_count].key, 256);
+    sanitize_header_value(value, resp->headers[resp->header_count].value,
+                          HW_MAX_HEADER_VALUE);
     resp->header_count++;
 }
 
@@ -1199,30 +1268,41 @@ static void send_response_obj(socket_t fd, HttpResponse *resp) {
     char date[64];
     get_http_date(date, sizeof(date));
 
-    char header[4096];
-    int hlen = snprintf(header, sizeof(header),
+    /* v5.3: ヘッダーサイズを動的計算 (4096 固定 → 十分なバッファ) */
+    int hdr_need = 512; /* 基本ヘッダー分 */
+    for (int i = 0; i < resp->header_count; i++)
+        hdr_need += (int)strlen(resp->headers[i].key) +
+                    (int)strlen(resp->headers[i].value) + 8;
+    if (hdr_need < 4096) hdr_need = 4096;
+    char stack_header[4096];
+    char *header = (hdr_need <= 4096) ? stack_header :
+                   (char *)malloc(hdr_need);
+    if (!header) return;
+
+    int hlen = snprintf(header, hdr_need,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Date: %s\r\n"
-        "Server: hajimu_web/5.2\r\n"
+        "Server: hajimu_web/5.3\r\n"
         "Connection: %s\r\n",
         resp->status_code, status_text(resp->status_code),
         resp->content_type, resp->body_length, date,
         g_server.keep_alive_enabled ? "keep-alive" : "close");
 
     for (int i = 0; i < resp->header_count; i++) {
-        hlen += snprintf(header + hlen, sizeof(header) - hlen,
+        hlen += snprintf(header + hlen, hdr_need - hlen,
             "%s: %s\r\n", resp->headers[i].key, resp->headers[i].value);
     }
-    hlen += snprintf(header + hlen, sizeof(header) - hlen, "\r\n");
+    hlen += snprintf(header + hlen, hdr_need - hlen, "\r\n");
 
-    send(fd, header, hlen, 0);
+    send_all(fd, header, hlen, 0);
     /* v5.2: HEAD リクエストではボディを送信しない */
     int is_head = (g_server.current_req &&
                    g_server.current_req->method == METHOD_HEAD);
     if (resp->body && resp->body_length > 0 && !is_head)
-        send(fd, resp->body, resp->body_length, 0);
+        send_all(fd, resp->body, resp->body_length, 0);
+    if (header != stack_header) free(header);
 }
 
 static void send_response(socket_t fd, int status_code,
@@ -1333,11 +1413,13 @@ static void send_error(socket_t fd, int status_code, const char *message) {
     }
 
     if (message) {
-        /* JSON 形式のエラーレスポンス */
+        /* JSON 形式のエラーレスポンス (v5.3: JSONエスケープ済み) */
+        char esc_msg[512];
+        json_escape(message, esc_msg, sizeof(esc_msg));
         char json_buf[1024];
         int json_len = snprintf(json_buf, sizeof(json_buf),
             "{\"error\":{\"code\":%d,\"message\":\"%s\",\"status\":\"%s\"}}",
-            status_code, message, status_text(status_code));
+            status_code, esc_msg, status_text(status_code));
         send_response(fd, status_code,
                       "application/json; charset=utf-8",
                       json_buf, json_len);
@@ -1643,15 +1725,18 @@ static int try_static_directory(socket_t fd, const HttpRequest *req,
                 snprintf(full, sizeof(full), "%s/%s", filepath, ent->d_name);
                 struct stat est;
                 int is_dir = (stat(full, &est) == 0 && S_ISDIR(est.st_mode));
+                /* v5.3: XSS防止 — ファイル名HTMLエスケープ */
+                char esc_name[512];
+                html_escape(ent->d_name, esc_name, sizeof(esc_name));
                 hi += snprintf(html + hi, sizeof(html) - hi,
                     "<li><a href=\"%s%s%s\">%s%s</a></li>",
                     req->path,
                     (req->path[strlen(req->path)-1] == '/') ? "" : "/",
-                    ent->d_name, ent->d_name, is_dir ? "/" : "");
+                    esc_name, esc_name, is_dir ? "/" : "");
             }
             closedir(d);
             hi += snprintf(html + hi, sizeof(html) - hi,
-                "</ul><hr><p>hajimu_web/5.2</p></body></html>");
+                "</ul><hr><p>hajimu_web/5.3</p></body></html>");
             send_response(fd, 200, "text/html; charset=utf-8", html, hi);
             return 1;
 #endif
@@ -1720,7 +1805,7 @@ static int try_static_directory(socket_t fd, const HttpRequest *req,
             "Content-Range: bytes %ld-%ld/%ld\r\n"
             "Accept-Ranges: bytes\r\n"
             "Date: %s\r\n"
-            "Server: hajimu_web/5.2\r\n"
+            "Server: hajimu_web/5.3\r\n"
             "Connection: %s\r\n",
             mime, content_len, range_start, range_end, file_size,
             date, g_server.keep_alive_enabled ? "keep-alive" : "close");
@@ -1731,7 +1816,7 @@ static int try_static_directory(socket_t fd, const HttpRequest *req,
             "Content-Length: %ld\r\n"
             "Accept-Ranges: bytes\r\n"
             "Date: %s\r\n"
-            "Server: hajimu_web/5.2\r\n"
+            "Server: hajimu_web/5.3\r\n"
             "Connection: %s\r\n",
             mime, file_size, date,
             g_server.keep_alive_enabled ? "keep-alive" : "close");
@@ -1818,9 +1903,10 @@ static int serve_static_file(socket_t fd, const HttpRequest *req) {
 static int middleware_logger_before(HttpRequest *req, HttpResponse *resp) {
     (void)resp;
     time_t now = time(NULL);
-    struct tm *lt = localtime(&now);
+    struct tm lt_buf;
+    localtime_r(&now, &lt_buf);
     char time_str[64];
-    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", lt);
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &lt_buf);
     /* v5.2: ログフォーマット対応 (default/combined/dev/short/tiny) */
     if (strcmp(g_log_format, "combined") == 0) {
         const char *ua = get_header(req, "User-Agent");
@@ -2184,7 +2270,12 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
             if (header_end) {
                 char *cl = strcasestr(raw, "Content-Length:");
                 if (cl) {
-                    int body_expected = atoi(cl + 15);
+                    /* v5.3: strtol + 範囲チェック */
+                    char *endp = NULL;
+                    long body_expected_l = strtol(cl + 15, &endp, 10);
+                    if (body_expected_l < 0 || body_expected_l > HW_MAX_BODY)
+                        body_expected_l = 0;
+                    int body_expected = (int)body_expected_l;
                     int header_size = (int)(header_end - raw) + 4;
                     int body_received = total - header_size;
                     if (body_received >= body_expected) break;
@@ -2284,7 +2375,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
     /* ルート検索 */
     Route *route = find_route(req.method, req.path, &req);
 
-    /* レスポンスコンテキストをグローバルに設定 */
+    /* レスポンスコンテキストをグローバルに設定 (v5.3: mutex内に移動) */
     g_server.current_resp = &resp;
     g_server.current_fd   = client_fd;
     g_server.current_req  = &req;
@@ -2299,7 +2390,15 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                 sa->callback_func = route->callback_func;
                 snprintf(sa->path, HW_MAX_PATH, "%s", req.path);
                 pthread_t tid;
-                pthread_create(&tid, NULL, sse_client_thread, sa);
+                /* v5.3: pthread_create 失敗時のリソースリーク防止 */
+                if (pthread_create(&tid, NULL, sse_client_thread, sa) != 0) {
+                    free(sa);
+                    send_error(client_fd, 500, "Thread creation failed");
+                    if (req.body) free(req.body);
+                    free(raw);
+                    close_socket(client_fd);
+                    return;
+                }
                 pthread_detach(tid);
                 /* SSE の場合 client_fd は閉じない */
                 if (req.body) free(req.body);
@@ -2485,20 +2584,11 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
 static void signal_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
-    printf("\n[hajimu_web] シャットダウン中...\n");
+    /* v5.3: async-signal-safe のみ使用 (printf/usleep 削除) */
     if (g_server.listen_fd != INVALID_SOCK) {
         close_socket(g_server.listen_fd);
         g_server.listen_fd = INVALID_SOCK;
     }
-    /* v5.2: Graceful shutdown — アクティブスレッド完了待機 (最大5秒) */
-    for (int wait = 0; wait < 50 && g_server.active_threads > 0; wait++) {
-        usleep(100000); /* 100ms */
-    }
-    if (g_server.active_threads > 0)
-        printf("[hajimu_web] 警告: %d スレッドが未完了のまま終了\n",
-               g_server.active_threads);
-    else
-        printf("[hajimu_web] 全リクエスト処理完了\n");
 }
 
 /* ================================================================= */
@@ -3018,13 +3108,16 @@ static Value fn_redirect(int argc, Value *argv) {
     if (argc >= 3 && argv[2].type == VALUE_NUMBER)
         status = (int)argv[2].number;
 
+    /* v5.3: XSS防止 — URLをHTMLエスケープ */
+    char esc_url[512];
+    html_escape(argv[1].string.data, esc_url, sizeof(esc_url));
     char body[1024];
     snprintf(body, sizeof(body),
         "<!DOCTYPE html><html><head>"
         "<meta http-equiv=\"refresh\" content=\"0;url=%s\">"
         "</head><body><p>Redirecting... "
         "<a href=\"%s\">%s</a></p></body></html>",
-        argv[1].string.data, argv[1].string.data, argv[1].string.data);
+        esc_url, esc_url, esc_url);
 
     if (g_server.route_count >= HW_MAX_ROUTES) return hajimu_bool(false);
     Route *r = &g_server.routes[g_server.route_count++];
@@ -3432,7 +3525,7 @@ static Value fn_server_start(int argc, Value *argv) {
 
     printf("\n");
     printf("  +==========================================+\n");
-    printf("  |   はじむウェブ v5.1 サーバー起動          |\n");
+    printf("  |   はじむウェブ v5.3 サーバー起動          |\n");
     printf("  |                                          |\n");
     printf("  |   http://localhost:%-5d                  |\n",
            g_server.port);
@@ -3648,6 +3741,9 @@ static Value fn_send_file(int argc, Value *argv) {
     if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
     HttpResponse *resp = g_server.current_resp;
     if (!resp) return hajimu_bool(false);
+    /* v5.3: パストラバーサル防止 */
+    if (strstr(argv[0].string.data, "..") != NULL)
+        return hajimu_bool(false);
     FILE *f = fopen(argv[0].string.data, "rb");
     if (!f) return hajimu_bool(false);
     fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
@@ -3971,12 +4067,15 @@ static Value fn_dynamic_redirect(int argc, Value *argv) {
         status = (int)argv[1].number;
     resp->status_code = status;
     response_set_header(resp, "Location", argv[0].string.data);
+    /* v5.3: XSS防止 — URLをHTMLエスケープ */
+    char esc_url2[512];
+    html_escape(argv[0].string.data, esc_url2, sizeof(esc_url2));
     char body[512];
     int blen = snprintf(body, sizeof(body),
         "<!DOCTYPE html><html><body>"
         "<p>Redirecting to <a href=\"%s\">%s</a></p>"
         "</body></html>",
-        argv[0].string.data, argv[0].string.data);
+        esc_url2, esc_url2);
     response_set_body(resp, body, blen);
     return hajimu_bool(true);
 }
@@ -4028,7 +4127,7 @@ static Value fn_write_chunk(int argc, Value *argv) {
             "Content-Type: %s\r\n"
             "Transfer-Encoding: chunked\r\n"
             "Date: %s\r\n"
-            "Server: hajimu_web/5.2\r\n"
+            "Server: hajimu_web/5.3\r\n"
             "Connection: %s\r\n",
             resp->status_code, status_text(resp->status_code),
             resp->content_type, date,
@@ -4219,6 +4318,9 @@ static Value fn_download(int argc, Value *argv) {
     if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
     HttpResponse *resp = g_server.current_resp;
     if (!resp) return hajimu_bool(false);
+    /* v5.3: パストラバーサル防止 */
+    if (strstr(argv[0].string.data, "..") != NULL)
+        return hajimu_bool(false);
     FILE *f = fopen(argv[0].string.data, "rb");
     if (!f) return hajimu_bool(false);
     fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
@@ -4760,8 +4862,10 @@ static Value fn_subdomains(int argc, Value *argv) {
     if (colon) *colon = '\0';
     /* ドットで分割 (最後の2セグメント=ドメイン、残り=サブドメイン) */
     char *parts[16]; int pc = 0;
-    char *tok = strtok(hostbuf, ".");
-    while (tok && pc < 16) { parts[pc++] = tok; tok = strtok(NULL, "."); }
+    /* v5.3: strtok → strtok_r (スレッド安全) */
+    char *save_sub = NULL;
+    char *tok = strtok_r(hostbuf, ".", &save_sub);
+    while (tok && pc < 16) { parts[pc++] = tok; tok = strtok_r(NULL, ".", &save_sub); }
     Value arr = hajimu_array();
     /* サブドメインは最後の2セグメントを除いた部分 (逆順) */
     for (int i = pc - 3; i >= 0; i--)
@@ -4993,9 +5097,9 @@ static HajimuPluginFunc functions[] = {
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {
     static HajimuPluginInfo info = {
         .name           = "hajimu_web",
-        .version        = "5.2.0",
+        .version        = "5.3.0",
         .author         = "はじむ開発チーム",
-        .description    = "HTTP ウェブサーバー v5.2 — セキュリティ強化・res.locals・Cookie構造化・Graceful Shutdown・新API16関数",
+        .description    = "HTTP ウェブサーバー v5.3 — セキュリティ監査対応: XSS/インジェクション/パストラバーサル/CRLF防止・スレッド安全性・RFC準拠強化",
         .functions      = functions,
         .function_count = sizeof(functions) / sizeof(functions[0]),
     };

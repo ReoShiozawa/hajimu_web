@@ -371,6 +371,28 @@ MIT License
 
 ## 📋 変更履歴
 
+### v5.3.0 — セキュリティ監査対応・脆弱性修正・スレッド安全性強化
+
+**🔴 セキュリティ修正（CRITICAL）:**
+- HTTP ヘッダーインジェクション（CRLF）防止 — `response_set_header` で `\r\n` を除去
+- XSS 防止: ディレクトリ一覧のファイル名を HTML エスケープ
+- XSS 防止: リダイレクト HTML のURLを HTML エスケープ
+- JSON インジェクション防止 — エラーレスポンスの message を JSON エスケープ
+- パストラバーサル防止 — `ファイル送信()` / `ダウンロード()` に `..` チェック追加
+- NUL バイトインジェクション防止 — `url_decode` で `%00` 除去 + hex バリデーション
+
+**🟠 バグ修正（HIGH）:**
+- `gmtime()` / `localtime()` → `gmtime_r()` / `localtime_r()` に変更（スレッド安全）
+- シグナルハンドラから async-signal-unsafe 関数（`printf` / `usleep`）を削除
+- レスポンスヘッダーバッファを 4096B 固定から動的計算に変更（トランケート防止）
+- `Content-Length` パースを `atoi` → `strtol` + 範囲チェックに変更（整数オーバーフロー防止）
+- `send()` を全送信ラッパー `send_all()` に変更（partial write 対応）
+- SSE `pthread_create` 失敗時のリソースリーク修正
+
+**🟡 改善（MEDIUM）:**
+- `strtok` → `strtok_r` に変更（`fn_subdomains`）
+- 起動バナーのバージョン表示を v5.3 に修正
+
 ### v5.2.0 — Express.js パリティ強化・HTTP 正確性・開発者ツール
 
 **🔴 バグ修正:**
