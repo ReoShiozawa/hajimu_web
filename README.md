@@ -6,7 +6,7 @@ Python の Flask / Node.js の Express のような、シンプルな API で HT
 
 ## ✨ 特徴
 
-- 🌐 HTTP/1.1 サーバー（GET / POST / PUT / DELETE / PATCH / OPTIONS / HEAD）
+- 🌐 HTTP/1.0 & HTTP/1.1 サーバー（GET / POST / PUT / DELETE / PATCH / OPTIONS / HEAD）
 - 🔀 パスルーティング（静的パス + パスパラメータ `:param` + オプショナルパラメータ `:param?` + ワイルドカード）
 - 📁 静的ファイル配信（MIME 自動判別 + ETag + Cache-Control + Range リクエスト対応）
 - 📂 複数静的ディレクトリ + ディレクトリリスティング
@@ -24,7 +24,9 @@ Python の Flask / Node.js の Express のような、シンプルな API で HT
 - 📊 Chunked Transfer Encoding（ストリーミング応答）
 - 🤝 コンテンツネゴシエーション（Accept ヘッダー判定）
 - 🛡️ Trust Proxy（X-Forwarded-For / X-Forwarded-Proto）
-- 🧵 マルチスレッド対応（オプション・mutex 保護）
+- 🧵 マルチスレッド対応（スレッドローカルコンテキスト・mutex 保護）
+- 🛡️ Slowloris 防御（30秒ハードタイムアウト）
+- 🔄 Transfer-Encoding: chunked リクエストボディ対応
 - ⚡ C 実装による高速動作
 - 🖥️ クロスプラットフォーム（macOS / Linux / Windows）
 
@@ -370,6 +372,34 @@ OS ソケット API (TCP/IP)
 MIT License
 
 ## 📋 変更履歴
+
+### v5.4.0 — スレッドローカルアーキテクチャ・セッション安全性・HTTP/1.0 対応・防御強化
+
+v5.3 セキュリティ監査で「将来的な大規模設計変更が必要」とされた残り14項目をすべて実装。
+
+**🔴 アーキテクチャ変更（CRITICAL）:**
+- スレッドローカルリクエストコンテキスト (`pthread_key_t`) — グローバル `current_resp/req/fd/session_id` を廃止し、`RequestContext` 構造体 + TLS アクセサ (`ctx_resp()` / `ctx_req()` / `ctx_fd()` / `ctx_session_id()`) に置換。マルチスレッド環境での競合状態を根本解決
+- セッション TOCTOU 防止 — `session_get/set/delete/destroy_var_safe()` 関数追加。find→操作の間 mutex を保持し、競合ウィンドウを排除
+- `g_request_start` グローバル変数を `RequestContext.request_start` に移動（スレッド安全）
+- `chunked_started` フラグを `WebServer` グローバルから `HttpResponse` 構造体に移動（per-response）
+
+**🟠 HTTP プロトコル改善（HIGH）:**
+- HTTP/1.0 レスポンスバージョンマッチ — リクエストの HTTP バージョンに応じて `HTTP/1.0` / `HTTP/1.1` を返却
+- HTTP/1.0 Keep-Alive — `Connection: keep-alive` が明示された場合のみ持続接続（HTTP/1.1 はデフォルト持続）
+- Transfer-Encoding: chunked リクエストボディデコーダ — チャンク形式リクエストを自動展開
+- `fn_write_chunk` の Chunked レスポンスも HTTP バージョンマッチ対応
+
+**🛡️ セキュリティ強化（HIGH）:**
+- Slowloris 攻撃防御 — `CLOCK_MONOTONIC` ベースの30秒ハードタイムアウト（408 Request Timeout 応答）
+- セッション再生成 (`fn_session_regenerate`) を mutex 保護下に書き直し
+- `fn_server_create` の二重初期化防止（`g_server.running` チェック）
+
+**🟡 リソース管理改善（MEDIUM）:**
+- レートリミッタ LRU 追い出し — テーブル満杯時に最古 `window_start` のエントリを再利用（従来は新規 IP をサイレントに無視）
+- セッションストア容量管理 — `HW_MAX_SESSIONS` 到達時に最古アクティブセッションを強制期限切れ
+- テンプレートエンジン再帰深度制限 — `{{>include}}` の最大再帰16段（`HW_TEMPLATE_MAX_DEPTH`）
+- `fread` 戻り値チェック — テンプレートファイル / `ファイル送信` / `ダウンロード` の3箇所
+- 405 Method Not Allowed もカスタムエラーハンドラチェーン経由に統合
 
 ### v5.3.0 — セキュリティ監査対応・脆弱性修正・スレッド安全性強化
 
