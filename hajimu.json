@@ -4,6 +4,6 @@
   "説明": "はじむ用 HTTPウェブサーバープラグイン v5.4 — スレッドローカルコンテキスト・セッションTOCTOU防止・HTTP/1.0対応・Slowloris防御・レートLRU・テンプレート再帰制限・chunkedリクエスト対応",
   "作者": "はじむ開発チーム",
   "メイン": "hajimu_web.hjp",
-  "ビルド": "make",
+  "ビルド": "make hajimu_web.hjp",
   "依存": {}
 }
