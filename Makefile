@@ -1,117 +1,96 @@
-# ==============================================================================
-# hajimu_web — はじむ用 HTTP ウェブサーバープラグイン ビルドファイル
-#
-# 使い方:
-#   make               ビルド（hajimu_web.hjp を生成）
-#   make clean          ビルド成果物を削除
-#   make install        ~/.hajimu/plugins/ にインストール
-#   make uninstall      インストール済みプラグインを削除
-#   make test           テストサーバーを起動
-#
-# クロスプラットフォーム対応（macOS / Linux / Windows MinGW）
-# ==============================================================================
+# =============================================================================
+# hajimu_web — はじむ用 HTTP ウェブサーバープラグイン
+# クロスプラットフォーム Makefile (macOS / Linux / Windows MinGW)
+# =============================================================================
 
-# プラグイン名
 PLUGIN_NAME = hajimu_web
+SRC         = src/hajimu_web.c
+OUT         = $(PLUGIN_NAME).hjp
+CC         ?= gcc
 
-# ソースファイル
-SRC = src/hajimu_web.c
-
-# はじむインクルードパス
-# 環境変数 HAJIMU_INCLUDE で指定可能。未設定時は相対パスから検索
-HAJIMU_INCLUDE ?= $(shell \
-	if [ -d "../../jp/include" ]; then echo "../../jp/include"; \
-	elif [ -d "../jp/include" ]; then echo "../jp/include"; \
-	elif [ -d "/usr/local/include/hajimu" ]; then echo "/usr/local/include/hajimu"; \
-	else echo "include"; fi)
-
-# コンパイラ
-CC ?= gcc
-
-# 共通フラグ
-CFLAGS = -Wall -Wextra -O2 -I$(HAJIMU_INCLUDE)
-
-# ==============================================================================
-# プラットフォーム判定
-# ==============================================================================
-
-UNAME := $(shell uname -s 2>/dev/null || echo Windows)
-
-ifeq ($(UNAME),Darwin)
-    # macOS
-    SHARED_FLAGS = -shared -dynamiclib -fPIC
-    OUT = $(PLUGIN_NAME).hjp
-    INSTALL_DIR = $(HOME)/.hajimu/plugins
-else ifeq ($(UNAME),Linux)
-    # Linux
-    SHARED_FLAGS = -shared -fPIC
-    OUT = $(PLUGIN_NAME).hjp
-    INSTALL_DIR = $(HOME)/.hajimu/plugins
+# OS 判定 ($(OS) は Windows CMD/PowerShell で "Windows_NT" になる)
+ifeq ($(OS),Windows_NT)
+    DETECTED_OS := Windows
+    INSTALL_DIR := $(USERPROFILE)/.hajimu/plugins
 else
-    # Windows (MinGW)
-    SHARED_FLAGS = -shared
-    OUT = $(PLUGIN_NAME).hjp
-    CFLAGS += -lws2_32
-    INSTALL_DIR = $(USERPROFILE)\.hajimu\plugins
+    DETECTED_OS := $(shell uname -s 2>/dev/null || echo Unknown)
+    INSTALL_DIR := $(HOME)/.hajimu/plugins
 endif
 
-# ==============================================================================
-# ターゲット
-# ==============================================================================
+# はじむインクルードパス自動検出
+ifeq ($(OS),Windows_NT)
+    ifndef HAJIMU_INCLUDE
+        HAJIMU_INCLUDE := $(or \
+            $(if $(wildcard ../../jp/include/hajimu.h),../../jp/include),\
+            $(if $(wildcard ../jp/include/hajimu.h),../jp/include),\
+            ./include)
+    endif
+else
+    ifndef HAJIMU_INCLUDE
+        HAJIMU_INCLUDE := $(shell \
+            if [ -d "../../jp/include" ]; then echo "../../jp/include"; \
+            elif [ -d "../jp/include" ]; then echo "../jp/include"; \
+            elif [ -d "/usr/local/include/hajimu" ]; then echo "/usr/local/include/hajimu"; \
+            else echo "include"; fi)
+    endif
+endif
 
-.PHONY: all clean install uninstall test help
+# コンパイル / リンクフラグ
+ifeq ($(OS),Windows_NT)
+    CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN
+    CFLAGS += -I$(HAJIMU_INCLUDE)
+    CFLAGS += -shared
+    LDFLAGS = -lws2_32 -lwinmm -static-libgcc
+else ifeq ($(DETECTED_OS),Darwin)
+    CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC -I$(HAJIMU_INCLUDE)
+    CFLAGS += -shared -dynamiclib
+    LDFLAGS = -lz -lpthread
+else
+    CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC -I$(HAJIMU_INCLUDE)
+    CFLAGS += -shared
+    LDFLAGS = -lz -lpthread
+endif
+
+.PHONY: all clean install uninstall help
 
 all: $(OUT)
-	@echo ""
-	@echo "  ✅ ビルド成功: $(OUT)"
-	@echo ""
-	@echo "  インストール:   make install"
-	@echo "  テスト:        make test"
-	@echo ""
+	@echo "  ビルド完了: $(OUT)"
 
 $(OUT): $(SRC)
-	$(CC) $(SHARED_FLAGS) $(CFLAGS) -o $@ $< -lz -lpthread
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
+ifeq ($(OS),Windows_NT)
+	-del /F /Q $(OUT) 2>NUL
+else
 	rm -f $(OUT)
-	@echo "  🧹 クリーン完了"
+endif
+	@echo "  クリーン完了"
 
 install: $(OUT)
+ifeq ($(OS),Windows_NT)
+	if not exist "$(INSTALL_DIR)\$(PLUGIN_NAME)" mkdir "$(INSTALL_DIR)\$(PLUGIN_NAME)"
+	copy /Y $(OUT) "$(INSTALL_DIR)\$(PLUGIN_NAME)"
+	copy /Y hajimu.json "$(INSTALL_DIR)\$(PLUGIN_NAME)"
+else
 	@mkdir -p $(INSTALL_DIR)/$(PLUGIN_NAME)
 	cp $(OUT) $(INSTALL_DIR)/$(PLUGIN_NAME)/
 	cp hajimu.json $(INSTALL_DIR)/$(PLUGIN_NAME)/
-	@echo ""
-	@echo "  📦 インストール完了: $(INSTALL_DIR)/$(PLUGIN_NAME)/"
-	@echo ""
+endif
+	@echo "  インストール完了: $(INSTALL_DIR)/$(PLUGIN_NAME)/"
 
 uninstall:
+ifeq ($(OS),Windows_NT)
+	-rmdir /S /Q "$(INSTALL_DIR)\$(PLUGIN_NAME)" 2>NUL
+else
 	rm -rf $(INSTALL_DIR)/$(PLUGIN_NAME)
-	@echo "  🗑  アンインストール完了"
-
-# テストサーバー起動（はじむで examples/hello_server.jp を実行）
-NIHONGO ?= $(shell \
-	if [ -x "../../jp/nihongo" ]; then echo "../../jp/nihongo"; \
-	elif command -v nihongo >/dev/null 2>&1; then echo "nihongo"; \
-	else echo "./nihongo"; fi)
-
-test: $(OUT)
-	@echo "  🚀 テストサーバーを起動..."
-	$(NIHONGO) examples/hello_server.jp
+endif
+	@echo "  アンインストール完了"
 
 help:
-	@echo ""
 	@echo "  hajimu_web — はじむ用 HTTP ウェブサーバープラグイン"
-	@echo ""
-	@echo "  ターゲット:"
-	@echo "    make             ビルド ($(OUT))"
-	@echo "    make clean       クリーン"
-	@echo "    make install     ~/.hajimu/plugins/ にインストール"
-	@echo "    make uninstall   アンインストール"
-	@echo "    make test        テストサーバー起動"
-	@echo "    make help        このヘルプ"
-	@echo ""
-	@echo "  環境変数:"
-	@echo "    HAJIMU_INCLUDE   はじむヘッダーパス (デフォルト: 自動検出)"
-	@echo "    CC               コンパイラ (デフォルト: gcc)"
-	@echo "    NIHONGO          はじむ実行パス (デフォルト: 自動検出)"
+	@echo "  macOS:   (OpenSSL/curl は標準で利用可能)"
+	@echo "  Linux:   sudo apt install zlib1g-dev"
+	@echo "  Windows: MSYS2 MinGW64 ターミナルで実行してください"
+	@echo "    pacman -S mingw-w64-x86_64-gcc"
 	@echo ""
