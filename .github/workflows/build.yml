@@ -1,0 +1,68 @@
+name: Build & Release hajimu_web
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            suffix: macos
+          - os: ubuntu-latest
+            suffix: linux-x64
+          - os: windows-latest
+            suffix: windows-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: はじむヘッダーを取得
+        uses: actions/checkout@v4
+        with:
+          repository: ReoShiozawa/hajimu
+          path: _hajimu
+          sparse-checkout: include
+
+      - name: ヘッダーをコピー
+        shell: bash
+        run: mkdir -p include && cp -r _hajimu/include/. include/
+
+      # ── macOS / Linux ─────────────────────────────────
+      - name: ビルド (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: make HAJIMU_INCLUDE=include
+
+      # ── Windows (MSYS2 MINGW64) ───────────────────────
+      - name: MSYS2 セットアップ (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc make
+
+      - name: ビルド (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make HAJIMU_INCLUDE=include
+
+      # ── アーティファクト整理 ────────────────────────────
+      - name: アーティファクトをリネーム
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp hajimu_web.hjp dist/hajimu_web-${{ matrix.suffix }}.hjp
+
+      - name: GitHub Releases にアップロード
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/hajimu_web-${{ matrix.suffix }}.hjp
