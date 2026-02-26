@@ -39,16 +39,16 @@ endif
 
 # コンパイル / リンクフラグ
 ifeq ($(OS),Windows_NT)
-    CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN
+    CFLAGS  = -Wall -Wextra -O2 -std=gnu11 -D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN
     CFLAGS += -I$(HAJIMU_INCLUDE)
     CFLAGS += -shared
-    LDFLAGS = -lws2_32 -lwinmm -static-libgcc
+    LDFLAGS = -lws2_32 -lwinmm -lz -static-libgcc
 else ifeq ($(DETECTED_OS),Darwin)
-    CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC -I$(HAJIMU_INCLUDE)
+    CFLAGS  = -Wall -Wextra -O2 -std=gnu11 -fPIC -I$(HAJIMU_INCLUDE)
     CFLAGS += -shared -dynamiclib
     LDFLAGS = -lz -lpthread
 else
-    CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC -I$(HAJIMU_INCLUDE)
+    CFLAGS  = -Wall -Wextra -O2 -std=gnu11 -fPIC -I$(HAJIMU_INCLUDE)
     CFLAGS += -shared
     LDFLAGS = -lz -lpthread
 endif

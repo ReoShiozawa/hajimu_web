@@ -38,6 +38,13 @@ jobs:
         shell: bash
         run: mkdir -p include && cp -r _hajimu/include/. include/
 
+      # ── Linux 依存ライブラリ ────────────────────────────
+      - name: Linux 依存インストール
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y zlib1g-dev
+
       # ── macOS / Linux ─────────────────────────────────
       - name: ビルド (macOS / Linux)
         if: runner.os != 'Windows'
@@ -50,7 +57,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc make
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib make
 
       - name: ビルド (Windows)
         if: runner.os == 'Windows'
