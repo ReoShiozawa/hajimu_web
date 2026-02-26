@@ -2,7 +2,10 @@ name: Build & Release hajimu_web
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -60,6 +63,12 @@ jobs:
         run: |
           mkdir -p dist
           cp hajimu_web.hjp dist/hajimu_web-${{ matrix.suffix }}.hjp
+
+      - name: CI アーティファクト保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: hajimu_web-${{ matrix.suffix }}
+          path: dist/
 
       - name: GitHub Releases にアップロード
         uses: softprops/action-gh-release@v2
