@@ -62,6 +62,16 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
     __hajimu_runtime = rt;
 }
 
+/* クロスプラットフォーム POSIX 拡張 */
+#if defined(__linux__) || defined(__APPLE__)
+#  ifndef _GNU_SOURCE
+#    define _GNU_SOURCE
+#  endif
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#endif
+
 #include <errno.h>
 #include <signal.h>
 #include <ctype.h>
@@ -82,6 +92,33 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
   #define INVALID_SOCK INVALID_SOCKET
   #define close_socket closesocket
   #define sock_errno WSAGetLastError()
+  /* Windows ポリフィル */
+  #include <sys/stat.h>
+  #include <io.h>
+  #ifndef S_ISDIR
+  #  define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+  #endif
+  static inline char *strcasestr(const char *h, const char *n) {
+      if (!*n) return (char *)h;
+      for (; *h; h++) {
+          if (tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+              const char *p = h, *q = n;
+              while (*p && *q && tolower((unsigned char)*p) == tolower((unsigned char)*q)) { p++; q++; }
+              if (!*q) return (char *)h;
+          }
+      }
+      return NULL;
+  }
+  static inline void usleep(unsigned int us) { Sleep(us / 1000 > 0 ? us / 1000 : 1); }
+  /* strptime / timegm — Windows 簡易実装 */
+  #include <time.h>
+  static inline time_t timegm(struct tm *t) {
+      time_t local = mktime(t);
+      struct tm *gm = gmtime(&local);
+      time_t diff = mktime(gm) - local;
+      return local - diff;
+  }
+  static char *strptime(const char *s, const char *f, struct tm *t);  /* 前方宣言 */
 #else
   #include <sys/socket.h>
   #include <netinet/in.h>
@@ -1075,6 +1112,45 @@ static void parse_multipart_body(HttpRequest *req) {
         p = de;
     }
 }
+
+/* ================================================================= */
+/* Windows strptime 実装                                              */
+/* ================================================================= */
+#ifdef _WIN32
+static char *strptime(const char *s, const char *fmt, struct tm *t) {
+    /* 最小限実装: HTTP日付に必要なフォーマットのみ対応 */
+    /* "%a, %d %b %Y %H:%M:%S GMT" など */
+    (void)fmt;
+    static const char *months[] = {
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec"
+    };
+    memset(t, 0, sizeof(*t));
+    const char *p = s;
+    /* 曜日をスキップ */
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
+    while (*p == ' ') p++;
+    /* 日 */
+    t->tm_mday = (int)strtol(p, (char **)&p, 10);
+    while (*p == ' ') p++;
+    /* 月名 */
+    for (int i = 0; i < 12; i++) {
+        if (strncasecmp(p, months[i], 3) == 0) { t->tm_mon = i; break; }
+    }
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    /* 年 */
+    t->tm_year = (int)strtol(p, (char **)&p, 10);
+    if (t->tm_year >= 1900) t->tm_year -= 1900;
+    while (*p == ' ') p++;
+    /* 時刻 */
+    t->tm_hour = (int)strtol(p, (char **)&p, 10); if (*p == ':') p++;
+    t->tm_min  = (int)strtol(p, (char **)&p, 10); if (*p == ':') p++;
+    t->tm_sec  = (int)strtol(p, (char **)&p, 10);
+    return (char *)p;
+}
+#endif
 
 /* ================================================================= */
 /* gzip 圧縮                                                          */

@@ -6,6 +6,20 @@
 PLUGIN_NAME = hajimu_web
 SRC         = src/hajimu_web.c
 OUT         = $(PLUGIN_NAME).hjp
+
+# vendored zlib (クロスコンパイル時に使用)
+ZLIB_SRC = vendor/zlib/adler32.c vendor/zlib/compress.c \
+           vendor/zlib/crc32.c vendor/zlib/deflate.c \
+           vendor/zlib/infback.c vendor/zlib/inffast.c \
+           vendor/zlib/inflate.c vendor/zlib/inftrees.c \
+           vendor/zlib/trees.c vendor/zlib/uncompr.c \
+           vendor/zlib/zutil.c
+
+# クロスコンパイラ
+LINUX_CC  ?= x86_64-linux-musl-gcc
+WIN_CC    ?= x86_64-w64-mingw32-gcc
+
+DIST = dist
 # CC ?= gcc だと GNU make 組み込みデフォルト(cc)が優先されるため = で上書き
 # コマンドラインから make CC=clang のように引き続きオーバーライド可能
 CC         = gcc
@@ -53,13 +67,63 @@ else
     LDFLAGS = -lz -lpthread
 endif
 
-.PHONY: all clean install uninstall help
+.PHONY: all clean install uninstall help build-all build-linux build-windows
 
 all: $(OUT)
 	@echo "  ビルド完了: $(OUT)"
 
 $(OUT): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# =============================================================================
+# クロスコンパイル (macOS ホストから全プラットフォーム向け .hjp を生成)
+# =============================================================================
+# 成果物は dist/ に配置:
+#   dist/hajimu_web-macos.hjp
+#   dist/hajimu_web-linux-x64.hjp
+#   dist/hajimu_web-windows-x64.hjp
+
+build-all: $(DIST)/$(PLUGIN_NAME)-macos.hjp \
+           $(DIST)/$(PLUGIN_NAME)-linux-x64.hjp \
+           $(DIST)/$(PLUGIN_NAME)-windows-x64.hjp
+	@echo ""
+	@echo "=== 全プラットフォームビルド完了 ==="
+	@ls -lh $(DIST)/$(PLUGIN_NAME)-*.hjp
+
+$(DIST):
+	mkdir -p $(DIST)
+
+# macOS (ネイティブ)
+$(DIST)/$(PLUGIN_NAME)-macos.hjp: $(SRC) | $(DIST)
+	$(CC) -shared -dynamiclib -fPIC -O2 -std=gnu11 \
+	  -D_DARWIN_C_SOURCE \
+	  -I$(HAJIMU_INCLUDE) \
+	  $< -o $@ \
+	  -lz -lpthread
+	@echo "  → $@"
+
+# Linux x86_64 (musl 静的リンク)
+# zlib は vendor/zlib/ をソースから組み込む (musl sysroot に zlib がないため)
+$(DIST)/$(PLUGIN_NAME)-linux-x64.hjp: $(SRC) $(ZLIB_SRC) | $(DIST)
+	$(LINUX_CC) -shared -fPIC -O2 -std=gnu11 \
+	  -D_GNU_SOURCE \
+	  -I$(HAJIMU_INCLUDE) -Ivendor/zlib \
+	  $< $(ZLIB_SRC) -o $@ \
+	  -lpthread -lm
+	@echo "  → $@"
+
+# Windows x86_64 (mingw-w64)
+# zlib は vendor/zlib/ をソースから組み込む
+$(DIST)/$(PLUGIN_NAME)-windows-x64.hjp: $(SRC) $(ZLIB_SRC) | $(DIST)
+	$(WIN_CC) -shared -O2 -std=gnu11 \
+	  -D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN \
+	  -I$(HAJIMU_INCLUDE) -Ivendor/zlib \
+	  $< $(ZLIB_SRC) -o $@ \
+	  -lws2_32 -lwinmm -lpthread -static-libgcc
+	@echo "  → $@"
+
+build-linux: $(DIST)/$(PLUGIN_NAME)-linux-x64.hjp
+build-windows: $(DIST)/$(PLUGIN_NAME)-windows-x64.hjp
 
 clean:
 ifeq ($(OS),Windows_NT)

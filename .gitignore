@@ -22,3 +22,12 @@
 *.xcodeproj/
 *.xcworkspace/
 patch_v5.py
+
+# vendor ライブラリ（ローカルでビルド、コミットしない）
+vendor/
+
+# ローカルヘッダーコピー（jp/include から参照）
+include/
+
+# ルートレベルの旧ビルド成果物（dist/ を使用）
+hajimu_web.hjp
