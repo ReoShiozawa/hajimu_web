@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/バージョン-5.4.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/バージョン-5.4.1-blue" alt="version">
   <img src="https://img.shields.io/badge/言語-C11-orange" alt="lang">
   <img src="https://img.shields.io/badge/ライセンス-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/対応-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">

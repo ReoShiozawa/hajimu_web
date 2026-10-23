@@ -1,12 +1,26 @@
 name: Build & Release hajimu_web
 
-# [暫定措置] CI 自動ビルドを無効化 — ローカルビルド + gh release 方式に移行
-# 元のトリガー: push(main + tags), pull_request(main), workflow_dispatch
 on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +37,11 @@ jobs:
     steps:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
+
+      - name: マニフェストv2を検証
+        shell: bash
+        run: |
+          jq -e '.schema_version == 2 and (.name | type == "string") and (.version | type == "string") and (.entry | type == "string") and (.dependencies | type == "object")' hajimu.json >/dev/null
 
       - name: はじむヘッダーを取得
         uses: actions/checkout@v4
@@ -68,14 +87,31 @@ jobs:
           mkdir -p dist
           cp hajimu_web.hjp dist/hajimu_web-${{ matrix.suffix }}.hjp
 
+      - name: チェックサム生成
+        shell: bash
+        run: |
+          for file in dist/*.hjp; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$file" > "$file.sha256"
+            else
+              shasum -a 256 "$file" > "$file.sha256"
+            fi
+          done
+
       - name: CI アーティファクト保存
         uses: actions/upload-artifact@v4
         with:
           name: hajimu_web-${{ matrix.suffix }}
           path: dist/
+      - name: Sign build provenance and SBOM
+        if: github.event_name != 'pull_request'
+        uses: ./.github/actions/release-integrity
+        with:
+          subject-path: dist/*.hjp
+          artifact-name: sbom-${{ matrix.suffix }}
 
       - name: GitHub Releases にアップロード
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: dist/hajimu_web-${{ matrix.suffix }}.hjp
+          files: dist/*

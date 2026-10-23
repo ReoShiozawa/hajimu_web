@@ -55,6 +55,20 @@
  *   Win:    make (MinGW)
  */
 
+/* クロスプラットフォーム POSIX 拡張 */
+#if defined(__linux__)
+#  ifndef _GNU_SOURCE
+#    define _GNU_SOURCE
+#  endif
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#elif defined(__APPLE__)
+#  ifndef _DARWIN_C_SOURCE
+#    define _DARWIN_C_SOURCE 1
+#  endif
+#endif
+
 #include "hajimu_plugin.h"
 
 /* hajimu_plugin_set_runtime デフォルト実装 */
@@ -62,23 +76,30 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
     __hajimu_runtime = rt;
 }
 
-/* クロスプラットフォーム POSIX 拡張 */
-#if defined(__linux__) || defined(__APPLE__)
-#  ifndef _GNU_SOURCE
-#    define _GNU_SOURCE
-#  endif
-#  ifndef _POSIX_C_SOURCE
-#    define _POSIX_C_SOURCE 200809L
-#  endif
-#endif
-
 #include <errno.h>
 #include <signal.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <zlib.h>
+
+static char *web_strcasestr(const char *haystack, const char *needle) {
+    if (*needle == '\0') return (char *)haystack;
+    for (; *haystack; haystack++) {
+        const char *left = haystack;
+        const char *right = needle;
+        while (*left && *right &&
+               tolower((unsigned char)*left) == tolower((unsigned char)*right)) {
+            left++;
+            right++;
+        }
+        if (*right == '\0') return (char *)haystack;
+    }
+    return NULL;
+}
 
 /* ================================================================= */
 /* プラットフォーム抽象化                                              */
@@ -98,17 +119,6 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
   #ifndef S_ISDIR
   #  define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
   #endif
-  static inline char *strcasestr(const char *h, const char *n) {
-      if (!*n) return (char *)h;
-      for (; *h; h++) {
-          if (tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
-              const char *p = h, *q = n;
-              while (*p && *q && tolower((unsigned char)*p) == tolower((unsigned char)*q)) { p++; q++; }
-              if (!*q) return (char *)h;
-          }
-      }
-      return NULL;
-  }
   static inline void usleep(unsigned int us) { Sleep(us / 1000 > 0 ? us / 1000 : 1); }
   /* strptime / timegm — Windows 簡易実装 */
   #include <time.h>
@@ -126,6 +136,8 @@ HAJIMU_PLUGIN_EXPORT void hajimu_plugin_set_runtime(HajimuRuntime *rt) {
   #include <arpa/inet.h>
   #include <unistd.h>
   #include <sys/stat.h>
+  #include <sys/select.h>
+  #include <strings.h>
   #include <fcntl.h>
   #include <dirent.h>
   typedef int socket_t;
@@ -1592,7 +1604,7 @@ static void send_error(socket_t fd, int status_code, const char *message) {
             if (result.type == VALUE_STRING) {
                 send_response(fd, status_code,
                     "text/html; charset=utf-8",
-                    result.string.data, result.string.length);
+                    result.string.data, result.string.byte_length);
                 __sync_fetch_and_add(&g_server.error_count, 1);
                 return;
             }
@@ -2514,7 +2526,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
         if (total >= 4) {
             char *header_end = strstr(raw, "\r\n\r\n");
             if (header_end) {
-                char *cl = strcasestr(raw, "Content-Length:");
+                char *cl = web_strcasestr(raw, "Content-Length:");
                 if (cl) {
                     /* v5.3: strtol + 範囲チェック */
                     char *endp = NULL;
@@ -2573,7 +2585,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
     /* v5.4: Transfer-Encoding: chunked リクエストボディデコード */
     {
         const char *te = get_header(&req, "Transfer-Encoding");
-        if (te && strcasestr(te, "chunked")) {
+        if (te && web_strcasestr(te, "chunked")) {
             /* ヘッダー末尾を見つける */
             char *hdr_end = strstr(raw, "\r\n\r\n");
             if (hdr_end) {
@@ -2709,7 +2721,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                     }
                     if (resp.body == NULL) {
                         response_set_body(&resp, result.string.data,
-                                          result.string.length);
+                                          result.string.byte_length);
                     }
                 } else if (result.type == VALUE_NUMBER) {
                     /* 数値を返した場合: ステータスコードとして使用 */
@@ -2731,7 +2743,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                         result.array.elements[2].type == VALUE_STRING)
                         response_set_body(&resp,
                             result.array.elements[2].string.data,
-                            result.array.elements[2].string.length);
+                            result.array.elements[2].string.byte_length);
                 }
                 if (resp.body == NULL) {
                     response_set_body(&resp, "OK", 2);
@@ -2780,7 +2792,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                 snprintf(resp.content_type, sizeof(resp.content_type),
                          "text/html; charset=utf-8");
                 response_set_body(&resp, result.string.data,
-                                  result.string.length);
+                                  result.string.byte_length);
             } else {
                 resp.status_code = 200;
                 snprintf(resp.content_type, sizeof(resp.content_type),
@@ -2839,7 +2851,7 @@ static void handle_client(socket_t client_fd, struct sockaddr_in *addr) {
                     pthread_mutex_unlock(&g_server.callback_mutex);
                     if (result.type == VALUE_STRING) {
                         response_set_body(&err_resp, result.string.data,
-                                          result.string.length);
+                                          result.string.byte_length);
                         handled = 1;
                         break;
                     }
@@ -3222,7 +3234,7 @@ static Value fn_error_page(int argc, Value *argv) {
     eh->status_code = (int)argv[0].number;
     snprintf(eh->content_type, sizeof(eh->content_type),
              "%s", argv[1].string.data);
-    int body_len = argv[2].string.length;
+    int body_len = argv[2].string.byte_length;
     eh->body = (char *)malloc(body_len + 1);
     if (eh->body) {
         memcpy(eh->body, argv[2].string.data, body_len + 1);
@@ -3243,7 +3255,7 @@ static Value fn_json_error_page(int argc, Value *argv) {
     eh->status_code = (int)argv[0].number;
     snprintf(eh->content_type, sizeof(eh->content_type),
              "application/json; charset=utf-8");
-    int body_len = argv[1].string.length;
+    int body_len = argv[1].string.byte_length;
     eh->body = (char *)malloc(body_len + 1);
     if (eh->body) {
         memcpy(eh->body, argv[1].string.data, body_len + 1);
@@ -3352,7 +3364,7 @@ static Value fn_template_get(int argc, Value *argv) {
         return hajimu_bool(false);
 
     Value rendered = fn_template_render(argc - 1, argv + 1);
-    if (rendered.type == VALUE_STRING && rendered.string.length > 0) {
+    if (rendered.type == VALUE_STRING && rendered.string.byte_length > 0) {
         return add_route(METHOD_GET, argv[0].string.data, 200,
                          "text/html; charset=utf-8",
                          rendered.string.data);
@@ -3690,7 +3702,7 @@ static int value_to_json(Value *val, char *buf, int buf_size) {
         }
         case VALUE_STRING: {
             written = snprintf(buf, buf_size, "\"");
-            for (int i = 0; i < val->string.length && written < buf_size - 2; i++) {
+            for (int i = 0; i < val->string.byte_length && written < buf_size - 2; i++) {
                 char c = val->string.data[i];
                 switch (c) {
                     case '"':  written += snprintf(buf+written, buf_size-written, "\\\""); break;
@@ -4039,7 +4051,7 @@ static Value fn_text_send(int argc, Value *argv) {
     if (!resp) return hajimu_bool(false);
     snprintf(resp->content_type, sizeof(resp->content_type),
              "text/plain; charset=utf-8");
-    response_set_body(resp, argv[0].string.data, argv[0].string.length);
+    response_set_body(resp, argv[0].string.data, argv[0].string.byte_length);
     return hajimu_bool(true);
 }
 
@@ -4050,7 +4062,7 @@ static Value fn_html_send(int argc, Value *argv) {
     if (!resp) return hajimu_bool(false);
     snprintf(resp->content_type, sizeof(resp->content_type),
              "text/html; charset=utf-8");
-    response_set_body(resp, argv[0].string.data, argv[0].string.length);
+    response_set_body(resp, argv[0].string.data, argv[0].string.byte_length);
     return hajimu_bool(true);
 }
 
@@ -4467,9 +4479,9 @@ static Value fn_write_chunk(int argc, Value *argv) {
     /* チャンクデータ送信 */
     char chunk_hdr[32];
     int ch = snprintf(chunk_hdr, sizeof(chunk_hdr), "%x\r\n",
-                      argv[0].string.length);
+                      argv[0].string.byte_length);
     send(fd, chunk_hdr, ch, 0);
-    send(fd, argv[0].string.data, argv[0].string.length, 0);
+    send(fd, argv[0].string.data, argv[0].string.byte_length, 0);
     send(fd, "\r\n", 2, 0);
     return hajimu_bool(true);
 }
@@ -5437,10 +5449,12 @@ static HajimuPluginFunc functions[] = {
 /* プラグイン初期化                                                    */
 /* ================================================================= */
 
+HAJIMU_PLUGIN_ABI_EXPORT()
+
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {
     static HajimuPluginInfo info = {
         .name           = "hajimu_web",
-        .version        = "5.4.0",
+        .version        = "5.4.1",
         .author         = "はじむ開発チーム",
         .description    = "HTTP ウェブサーバー v5.4 — スレッドローカルコンテキスト・TOCTOU防止・HTTP/1.0対応・Slowloris防御・レートLRU・テンプレート再帰制限・chunkedリクエスト対応",
         .functions      = functions,
