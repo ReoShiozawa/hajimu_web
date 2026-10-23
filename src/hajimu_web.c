@@ -119,7 +119,7 @@ static char *web_strcasestr(const char *haystack, const char *needle) {
   #ifndef S_ISDIR
   #  define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
   #endif
-  static inline void usleep(unsigned int us) { Sleep(us / 1000 > 0 ? us / 1000 : 1); }
+  static inline void hjp_sleep_us(unsigned int us) { Sleep(us / 1000 > 0 ? us / 1000 : 1); }
   /* strptime / timegm — Windows 簡易実装 */
   #include <time.h>
   static inline time_t timegm(struct tm *t) {
@@ -144,6 +144,7 @@ static char *web_strcasestr(const char *haystack, const char *needle) {
   #define INVALID_SOCK (-1)
   #define close_socket close
   #define sock_errno errno
+  static inline void hjp_sleep_us(unsigned int us) { usleep(us); }
 #endif
 
 /* ================================================================= */
@@ -3944,7 +3945,7 @@ static Value fn_server_start(int argc, Value *argv) {
 
     /* スレッド完了待ち */
     for (int wait = 0; wait < 50 && g_server.active_threads > 0; wait++)
-        usleep(100000); /* 100ms */
+        hjp_sleep_us(100000); /* 100ms */
 
     for (int i = 0; i < g_server.route_count; i++) {
         if (g_server.routes[i].static_body) {
